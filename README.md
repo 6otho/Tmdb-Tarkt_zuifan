@@ -1,182 +1,147 @@
-🎬 Cloudflare Worker 追番列表配置指南
+# 🎬 Cloudflare Worker 追番/观影列表配置指南
 
-本项目是一个基于 Cloudflare Worker 的个人追番/观影列表，数据源自 Trakt 和 TMDB。在使用本代码前，你需要获取以下三个核心参数：
+本项目是一个基于 Cloudflare Worker 的个人影视追踪页面。你需要获取 **TMDB** 和 **Trakt** 的授权信息才能正常运行。
 
-TMDB_TOKEN (用于获取封面图片和中文元数据)
+> **⚠️ 准备工作**
+> 1. 一个 **TMDB** 账号
+> 2. 一个 **Trakt** 账号
+> 3. 打开文本编辑器（记事本），用于临时存放获取到的密钥
 
-TRAKT_CLIENT_ID (用于连接 Trakt API)
+---
 
-TRAKT_ACCESS_TOKEN (用于获取你的个人观看记录)
+## 🟢 第一步：获取 TMDB Token (封面数据源)
 
-🟢 第一步：获取 TMDB Token
+我们需要 TMDB 的 API 令牌来获取海报和中文简介。
 
-TMDB (The Movie Database) 提供电影和剧集的详细信息。
+### 1. 注册与申请
+1. 访问官网：[https://www.themoviedb.org/](https://www.themoviedb.org/) 并登录。
+2. 点击右上角头像 → 选择 **Settings (设置)**。
+3. 在左侧菜单栏点击 **API**。
+4. 点击 **Create (创建)** 或 **Request an API Key**，选择 **Developer (开发者)**。
+5. **填写申请表**（内容可以随意填，如下）：
+   - **Type of use**: `Personal`
+   - **URL**: `http://localhost`
+   - **Summary**: `For personal watchlist display`
+   - 补全地址信息后提交。
 
-注册/登录
+### 2. 复制关键 Token
+申请成功后，在 API 页面下方找到 **API Read Access Token (v4 auth)**。
 
-访问官网：https://www.themoviedb.org/
+> ❌ **不要复制** 那个很短的 API Key。
+> ✅ **要复制** 那个 **以 `eyJ` 开头、特别长** 的字符串。
 
-登录你的账号（如果没有请先注册）。
+👉 **请将它暂时保存，记作：`TMDB_TOKEN`**
 
-申请 API
+---
 
-点击右上角头像 -> 选择 Settings (设置)。
+## 🔴 第二步：创建 Trakt 应用 (历史记录源)
 
-在左侧菜单点击 API。
+我们需要创建一个“应用”来允许 Worker 读取你的观看历史。
 
-点击 Create (创建) 或 Request an API Key。
+### 1. 创建应用
+1. 访问开发者后台：[https://trakt.tv/oauth/applications](https://trakt.tv/oauth/applications)
+2. 点击右上角的绿色按钮 **NEW APPLICATION**。
 
-选择 Developer (开发者)。
+### 2. 填写配置（⚡️ 极其重要）
+请严格按照以下内容填写，否则下一步无法获取 Token：
 
-填写申请表：
+- **Name**: `MyWorkerList` (或者你喜欢的名字)
+- **Description**: `Personal list`
+- **Redirect URI**: 必须填入下方这行代码 👇
+  ```text
+  urn:ietf:wg:oauth:2.0:oob
+  ```
+- **Javascript (CORS) origins**: 留空即可。
+- **Permissions**: 保持默认勾选。
 
-用途: Personal
+点击底部的 **SAVE APP** 保存。
 
-网址: http://localhost (随意填写)
+### 3. 保存 ID 和 Secret
+保存成功后，页面上方会显示应用信息：
+- 复制 **Client ID** 👉 **记作：`TRAKT_CLIENT_ID`**
+- 复制 **Client Secret** 👉 **记作：`TRAKT_CLIENT_SECRET`** (下一步要用)
 
-简介: Personal watchlist display (随意填写)
+---
 
-补全地址信息后提交。
+## 🔵 第三步：手动获取 Access Token (最关键一步)
 
-复制 Token
+由于 Trakt 需要 OAuth2 验证，我们需要手动生成一个永久访问令牌。我们将使用 **ReqBin** 这个在线工具来完成。
 
-申请成功后，在 API 页面找到 API Read Access Token (v4 auth)。
+### 3.1 获取授权验证码 (Code)
+1. 复制下方链接到记事本：
+   ```text
+   https://trakt.tv/oauth/authorize?response_type=code&client_id=你的Client_ID&redirect_uri=urn:ietf:wg:oauth:2.0:oob
+   ```
+2. 将链接中的 `你的Client_ID` 替换为 **第二步获取的 Client ID**。
+3. 将替换好的完整链接粘贴到浏览器访问。
+4. 点击绿色按钮 **Yes** 允许授权。
+5. 页面会显示一串 **8位数的验证码**，复制它。
 
-⚠️ 注意：复制那个以 eyJ 开头的超级长的字符串，不是短的 API Key。
+### 3.2 使用 ReqBin 换取 Token
+1. 打开在线工具：[https://reqbin.com/](https://reqbin.com/)
+2. **配置请求面板**（请严格按照图文操作）：
+   - **请求方式**: 点击下拉菜单，将 `GET` 改为 **`POST`**。
+   - **API 地址**: 填入 `https://api.trakt.tv/oauth/token`
+   - **Headers**: 点击 `Headers` 标签页，填入：
+     ```text
+     Content-Type: application/json
+     ```
+3. **填写 JSON 内容**:
+   - 点击 `Content` 标签页。
+   - 确保格式选择的是 **JSON**。
+   - 复制下方代码框的内容，并**修改为你自己的数据**：
 
-✅ 保存为: TMDB_TOKEN
+   ```json
+   {
+       "code": "这里填刚才获取的8位验证码",
+       "client_id": "这里填第二步的 Client ID",
+       "client_secret": "这里填第二步的 Client Secret",
+       "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+       "grant_type": "authorization_code"
+   }
+   ```
 
-🔴 第二步：获取 Trakt Client ID & Secret
+4. **发送与获取**:
+   - 点击黄色的 **Send** 按钮。
+   - 查看右侧的返回结果。
+   - 找到 `"access_token": "..."` 这一行。
+   - 引号里那一串乱码就是我们要的。
 
-Trakt 用于同步你的观看历史和日历。
+👉 **请保存它，记作：`TRAKT_ACCESS_TOKEN`**
 
-创建应用
+---
 
-访问开发者后台：https://trakt.tv/oauth/applications
+## 📝 第四步：填入代码配置
 
-点击右上角的 NEW APPLICATION。
+回到你的 `worker.js` 代码文件，找到最顶部的配置区域，将刚才获取的三个参数填入双引号中。
 
-填写配置 (⚠️ 关键步骤)
-
-Name: MyWorkerList (随意)
-
-Redirect URI: 必须严格填入以下地址 👇
-
-code
-Text
-download
-content_copy
-expand_less
-urn:ietf:wg:oauth:2.0:oob
-
-Permissions: 保持默认即可。
-
-点击底部的 SAVE APP。
-
-保存密钥
-
-保存页面上显示的 Client ID (这是 TRAKT_CLIENT_ID)。
-
-保存页面上显示的 Client Secret (下一步换 Token 用)。
-
-🔵 第三步：获取 Trakt Access Token (使用 ReqBin)
-
-这是最重要的一步，我们需要用“验证码”换取“访问令牌”。
-
-3.1 获取授权码 (Code)
-
-复制下方链接到记事本：
-
-code
-Text
-download
-content_copy
-expand_less
-https://trakt.tv/oauth/authorize?response_type=code&client_id=你的Client_ID&redirect_uri=urn:ietf:wg:oauth:2.0:oob
-
-将链接中的 你的Client_ID 替换为第二步获取的 ID。
-
-在浏览器访问替换后的链接，点击绿色按钮 Yes 授权。
-
-复制页面显示的 8位数字验证码。
-
-3.2 使用 ReqBin 换取 Token
-
-打开在线 API 工具：https://reqbin.com/
-
-设置请求头：
-
-方法下拉框选择：POST
-
-地址栏填入：https://api.trakt.tv/oauth/token
-
-点击 Headers 标签，填入：Content-Type: application/json
-
-填写内容 (Content)：
-
-点击 Content 标签，选择 JSON 格式。
-
-复制下方代码填入（替换为你自己的数据）：
-
-code
-JSON
-download
-content_copy
-expand_less
-{
-    "code": "这里填刚才获取的8位验证码",
-    "client_id": "这里填第二步的 Client ID",
-    "client_secret": "这里填第二步的 Client Secret",
-    "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
-    "grant_type": "authorization_code"
-}
-
-发送请求：
-
-点击 Send。
-
-在右侧返回结果中找到 "access_token": "..."。
-
-✅ 引号里的字符串就是：TRAKT_ACCESS_TOKEN
-
-⚠️ 提示：如果报错，通常是因为验证码过期了。验证码是一次性的，请重新执行 3.1 步骤获取新验证码，并立即使用。
-
-📝 第四步：填入代码
-
-回到你的 worker.js 文件，找到顶部的配置区进行修改：
-
-code
-JavaScript
-download
-content_copy
-expand_less
+```javascript
 // ============================================
 // 🔴 必填：配置区
 // ============================================
 
-// 1. 填入第一步获取的 TMDB Token (eyJ开头...)
+// 1. 填入第一步获取的 TMDB 长 Token (eyJ开头...)
 const TMDB_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJu..."; 
 
-// 2. Trakt 配置 (必须填入才能获取播放时间)
+// 2. Trakt 配置
 // 填入第二步获取的 Client ID
-const TRAKT_CLIENT_ID = "609ffd95de..."; 
+const TRAKT_CLIENT_ID = "609ffd95de13..."; 
 
-// 3. 填入第三步获取的 Access Token
-const TRAKT_ACCESS_TOKEN = "95e773e179..."; 
+// 3. 填入第三步 ReqBin 返回的 Access Token
+const TRAKT_ACCESS_TOKEN = "95e773e1792a..."; 
+```
 
-// 下方代码无需修改...
-🛠 常见问题
+---
 
-列表是空的？
+## 🛠 常见错误排查
 
-请确保你在 Trakt 网站上已经标记了一些看过的内容或者添加了待看列表。
+1. **ReqBin 报错 401 或 400？**
+   - **原因**：验证码（Code）过期了。
+   - **解决**：Code 是一次性的且时效很短。请重新执行 **3.1 步骤** 获取新的验证码，然后立刻去 ReqBin 发送请求。
 
-请确保 TMDB_TOKEN 是 v4 版本的长 Token。
+2. **ReqBin 报错 "redirect_uri mismatch"？**
+   - **原因**：Trakt 后台的 Redirect URI 填错了。
+   - **解决**：回到 Trakt 开发者后台，确保 Redirect URI 填的是 `urn:ietf:wg:oauth:2.0:oob`，一个字都不能差。
 
-ReqBin 返回 401/400 错误？
-
-验证码（Code）只能用一次，且有时效性。重新访问授权链接获取新 Code 再试。
-
-确保 JSON 格式没有少逗号或引号。
-
-确保 Trakt 后台的 Redirect URI 必须是 urn:ietf:wg:oauth:2.0:oob。
+3. **页面显示空白？**
+   - **解决**：去 Trakt.tv 网站上随便标记一部电影为“看过” (History) 或者加入“待看” (Watchlist)，列表才会有内容。
