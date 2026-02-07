@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (iPhone 14/全面屏 完美紧凑适配版)
+ * Cloudflare Worker 追番列表 (最终版：详情页评分UI美化 + 官方Logo + 题材标签)
  * ==============================================================================
  */
 
@@ -127,6 +127,7 @@ async function hydrateTrakt(env, items, typeOverride) {
         if (!tmdbId) return null;
 
         try {
+            // 请求 TMDB 详情 (包含 Genres)
             const r = await fetch(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}?language=zh-CN`, { 
                 headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } 
             });
@@ -146,7 +147,7 @@ async function hydrateTrakt(env, items, typeOverride) {
             }
 
             return { 
-                ...d, 
+                ...d, // 这里的 d 包含了 genres, vote_average, vote_count 等
                 media_type: mediaType, 
                 trakt_type: typeOverride, 
                 air_time_iso: airTime, 
@@ -199,7 +200,7 @@ const htmlContent = `
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>TMDB&Trakt iOS26</title>
+<title>Reflix</title>
 <link rel="icon" type="image/png" href="https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
@@ -213,9 +214,10 @@ const htmlContent = `
     --accent-purple: #6D28D9; 
     --glass-nav: rgba(255, 255, 255, 0.75);
     --glass-border: rgba(255, 255, 255, 0.4);
+    --tmdb-color: #0d253f;
+    --trakt-color: #ed1c24;
   }
 
-  /* 🔴 全局锁定，禁止回弹 */
   html, body {
     width: 100%; height: 100%;
     margin: 0; padding: 0;
@@ -224,8 +226,7 @@ const htmlContent = `
     background-color: var(--bg-app);
     -webkit-tap-highlight-color: transparent;
     overscroll-behavior: none;
-    position: fixed; 
-    left: 0; top: 0;
+    position: fixed; left: 0; top: 0;
   }
 
   #app-container {
@@ -234,7 +235,6 @@ const htmlContent = `
     background-color: var(--bg-app);
     display: flex; flex-direction: column;
     overflow: hidden;
-    /* 🔴 顶部安全距离适配：利用 padding 顶开刘海 */
     padding-top: env(safe-area-inset-top); 
   }
 
@@ -250,14 +250,13 @@ const htmlContent = `
         position: relative; inset: auto;
         border-radius: 44px; border: 8px solid #2a2a2a;
         box-shadow: 0 0 60px rgba(0,0,0,0.6);
-        padding-top: 10px; /* 桌面端稍微给点顶距 */
+        padding-top: 10px;
     }
   }
 
-  /* Header 紧贴顶部 */
+  /* Header */
   .header-nav {
     flex-shrink: 0; display: flex; justify-content: space-between; align-items: center;
-    /* 减少上下 padding，让元素更靠上 */
     padding: 8px 20px 4px 20px; 
     background: transparent; z-index: 20;
   }
@@ -271,7 +270,7 @@ const htmlContent = `
     box-shadow: 0 4px 10px rgba(0,0,0,0.05);
   }
   .seg-btn {
-    border-radius: 99px; padding: 6px 14px; /* 稍微缩小一点 */
+    border-radius: 99px; padding: 6px 14px;
     display: flex; align-items: center; justify-content: center; gap: 6px;
     color: #444; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); 
     font-size: 13px; cursor: pointer;
@@ -307,12 +306,9 @@ const htmlContent = `
   }
   .week-pill.active { background: #7C3AED; color: #fff; box-shadow: 0 3px 8px rgba(124, 58, 237, 0.3); }
 
-  /* 🔴 滚动区域优化 */
+  /* Scroll Content */
   .scroll-content {
-    flex: 1; 
-    overflow-y: auto; 
-    padding: 6px 16px; /* 两侧间距微调 */
-    /* 底部 padding = Dock高度(56) + 悬浮(8) + 安全区 + 留白(10) */
+    flex: 1; overflow-y: auto; padding: 6px 16px; 
     padding-bottom: calc(75px + env(safe-area-inset-bottom));
     -webkit-overflow-scrolling: touch;
     overscroll-behavior-y: contain;
@@ -320,9 +316,9 @@ const htmlContent = `
   .scroll-content::-webkit-scrollbar { display: none; }
   .list-container { display: flex; flex-direction: column; gap: 14px; }
 
-  /* ================= 卡片设计 ================= */
+  /* ================= Card ================= */
   .rich-card {
-    position: relative; width: 100%; height: 135px; /* 卡片高度微调 */
+    position: relative; width: 100%; height: 135px;
     border-radius: 22px; overflow: hidden; background: #fff;
     box-shadow: 0 6px 16px -4px rgba(0, 0, 0, 0.1);
     display: flex; align-items: center; flex-shrink: 0;
@@ -340,88 +336,106 @@ const htmlContent = `
 
   .title-txt { font-size: 16px; font-weight: 900; color: #111; margin-bottom: 2px; line-height: 1.2; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; letter-spacing: -0.3px; }
   .subtitle-txt { font-size: 12px; color: #555; font-weight: 600; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 4px; }
-  
   .status-txt { font-size: 11px; color: #666; font-weight: 600; margin-bottom: auto; display: flex; align-items: center; gap: 4px; }
 
-  /* 胶囊进度条 */
   .capsule-bar { 
       margin-bottom: 5px; width: 88%; height: 24px; 
       background: rgba(0, 0, 0, 0.12);
-      border-radius: 99px; 
-      display: flex; align-items: center;
+      border-radius: 99px; display: flex; align-items: center;
       position: relative; backdrop-filter: blur(10px);
       padding: 2px; border: 1px solid rgba(255,255,255,0.1);
   }
   .capsule-left { 
-      background: #000; color: #fff; 
-      padding: 0 10px; height: 100%;
+      background: #000; color: #fff; padding: 0 10px; height: 100%;
       display: flex; align-items: center; justify-content: center;
-      font-size: 10px; font-weight: 800; 
-      border-radius: 99px; 
-      white-space: nowrap; z-index: 2;
-      box-shadow: 2px 0 6px rgba(0,0,0,0.15);
+      font-size: 10px; font-weight: 800; border-radius: 99px; 
+      white-space: nowrap; z-index: 2; box-shadow: 2px 0 6px rgba(0,0,0,0.15);
   }
   .capsule-right { 
-      flex: 1; text-align: right; padding-right: 10px; 
-      color: #000; font-size: 10px; font-weight: 700; 
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; 
-      opacity: 0.8;
+      flex: 1; text-align: right; padding-right: 10px; color: #000; 
+      font-size: 10px; font-weight: 700; white-space: nowrap; 
+      overflow: hidden; text-overflow: ellipsis; opacity: 0.8;
   }
-
   .check-mark { 
       position: absolute; bottom: 7px; right: 10px; 
       color: var(--accent-purple); font-size: 15px; 
       filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1)); z-index: 5;
   }
 
-  /* ================= 🔴 iOS 26 Dock (紧凑版) ================= */
+  /* ================= Dock ================= */
   .bottom-nav {
-    position: absolute; 
-    left: 50%; transform: translateX(-50%);
-    /* 宽度稍微变宽，利用屏幕空间 */
-    width: 92%; max-width: 380px; 
-    /* 高度缩小至 56px (标准iOS TabBar高度) */
-    height: 56px;
+    position: absolute; left: 50%; transform: translateX(-50%);
+    width: 92%; max-width: 380px; height: 56px;
     background: var(--glass-nav);
     backdrop-filter: blur(25px) saturate(180%);
     -webkit-backdrop-filter: blur(25px) saturate(180%);
-    border-radius: 99px; 
-    border: 1px solid var(--glass-border);
+    border-radius: 99px; border: 1px solid var(--glass-border);
     box-shadow: 0 10px 25px rgba(0,0,0,0.12);
     display: flex; justify-content: space-evenly; align-items: center;
-    z-index: 50; 
-    /* 🔴 核心修改：紧贴 Home Indicator，仅留 8px 间距 */
-    bottom: calc(8px + env(safe-area-inset-bottom));
+    z-index: 50; bottom: calc(8px + env(safe-area-inset-bottom));
   }
-  
   .nav-btn { 
       display: flex; flex-direction: column; align-items: center; justify-content: center; 
-      color: #999; font-size: 9px; gap: 2px; /* 字体缩小，间距缩小 */
-      width: 60px; height: 100%; 
+      color: #999; font-size: 9px; gap: 2px; width: 60px; height: 100%; 
       transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); 
   }
-  .nav-btn i { font-size: 20px; transition: transform 0.3s; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.05)); } /* 图标缩小 */
+  .nav-btn i { font-size: 20px; transition: transform 0.3s; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.05)); } 
   .nav-btn.active { color: #000; }
   .nav-btn.active i { transform: translateY(-2px) scale(1.1); color: #7C3AED; filter: drop-shadow(0 3px 6px rgba(124, 58, 237, 0.25)); }
-  
   .user-avatar { width: 24px; height: 24px; border-radius: 50%; background: #ccc; border: 2px solid transparent; transition: all 0.3s; box-shadow: 0 2px 5px rgba(0,0,0,0.15); }
   .nav-btn.active .user-avatar { border-color: #7C3AED; transform: translateY(-2px) scale(1.05); }
 
-  /* Modal */
+  /* ================= 🔴 Detail Sheet (美化版) ================= */
   .modal-overlay { position: absolute; inset: 0; z-index: 100; background: rgba(0,0,0,0.3); backdrop-filter: blur(6px); display: flex; align-items: flex-end; transition: opacity 0.3s; }
   @media (max-width: 1024px) { .modal-overlay { position: fixed; bottom: 0; left: 0; right: 0; top: 0; } }
   
-  .detail-sheet { width: 100%; max-height: 85%; background: #fff; border-radius: 32px 32px 0 0; padding-bottom: calc(30px + env(safe-area-inset-bottom)); box-shadow: 0 -10px 50px rgba(0,0,0,0.2); display: flex; flex-direction: column; overflow: hidden; animation: slideUp 0.4s cubic-bezier(0.19, 1, 0.22, 1); }
+  .detail-sheet { 
+      width: 100%; max-height: 85%; background: #fff; 
+      border-radius: 32px 32px 0 0; 
+      padding-bottom: calc(30px + env(safe-area-inset-bottom)); 
+      box-shadow: 0 -10px 50px rgba(0,0,0,0.25); 
+      display: flex; flex-direction: column; overflow: hidden; 
+      animation: slideUp 0.4s cubic-bezier(0.19, 1, 0.22, 1); 
+  }
   @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
-  .sheet-header { height: 220px; position: relative; flex-shrink: 0; }
-  .sheet-backdrop { width: 100%; height: 100%; object-fit: cover; }
-  .sheet-close { position: absolute; top: 16px; right: 16px; width: 32px; height: 32px; border-radius: 50%; background: rgba(0,0,0,0.4); color: #fff; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(15px); cursor: pointer; border: 1px solid rgba(255,255,255,0.2); }
-  .sheet-body { padding: 20px; overflow-y: auto; }
-  .sheet-title { font-size: 24px; font-weight: 900; line-height: 1.1; margin-bottom: 8px; color: #111; letter-spacing: -0.5px; }
-  .sheet-meta { display: flex; gap: 8px; font-size: 12px; color: #666; margin-bottom: 16px; font-weight: 700; flex-wrap: wrap; }
-  .meta-tag { background: #F3F4F6; padding: 6px 10px; border-radius: 8px; }
-  .sheet-overview { font-size: 15px; line-height: 1.6; color: #444; margin-bottom: 24px; font-weight: 400; }
-  .sheet-btn { width: 100%; padding: 14px; border-radius: 18px; background: #111; color: #fff; font-weight: 800; font-size: 16px; display: flex; justify-content: center; align-items: center; gap: 10px; box-shadow: 0 10px 20px rgba(0,0,0,0.2); transition: transform 0.2s; }
+  
+  .sheet-header { height: 240px; position: relative; flex-shrink: 0; }
+  .sheet-backdrop { width: 100%; height: 100%; object-fit: cover; mask-image: linear-gradient(to bottom, black 60%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%); }
+  .sheet-close { position: absolute; top: 16px; right: 16px; width: 34px; height: 34px; border-radius: 50%; background: rgba(0,0,0,0.5); color: #fff; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(15px); cursor: pointer; border: 1px solid rgba(255,255,255,0.2); }
+  
+  .sheet-body { padding: 0 24px 20px 24px; overflow-y: auto; margin-top: -40px; position: relative; z-index: 2; }
+  
+  /* 🔴 标题加大 */
+  .sheet-title { font-size: 28px; font-weight: 900; line-height: 1.1; margin-bottom: 16px; color: #111; letter-spacing: -0.5px; text-shadow: 0 20px 40px #fff; }
+  
+  /* 🔴 评分栏 (新) */
+  .rating-row { display: flex; gap: 12px; margin-bottom: 16px; align-items: center; }
+  .rating-badge { 
+      display: flex; align-items: center; gap: 6px; 
+      padding: 6px 12px; border-radius: 12px; 
+      font-size: 13px; font-weight: 800;
+  }
+  .rating-badge.tmdb { background: rgba(13, 37, 63, 0.08); color: var(--tmdb-color); }
+  .rating-badge.trakt { background: rgba(237, 28, 36, 0.08); color: var(--trakt-color); }
+  
+  .platform-logo { height: 14px; width: auto; }
+  .score-val { font-size: 15px; }
+
+  /* 🔴 题材标签栏 (新) */
+  .genre-row { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 20px; padding-bottom: 4px; }
+  .genre-row::-webkit-scrollbar { display: none; }
+  .genre-pill {
+      flex-shrink: 0; padding: 4px 10px; border-radius: 8px; 
+      border: 1px solid rgba(0,0,0,0.1); color: #666; 
+      font-size: 11px; font-weight: 600; background: #fff;
+  }
+  
+  .sheet-info-grid { display: flex; gap: 15px; margin-bottom: 20px; font-size: 13px; color: #555; font-weight: 600; }
+  .info-item { display: flex; align-items: center; gap: 5px; }
+
+  .sheet-overview { font-size: 16px; line-height: 1.6; color: #333; margin-bottom: 30px; font-weight: 400; opacity: 0.9; }
+  
+  .sheet-btn { width: 100%; padding: 16px; border-radius: 18px; background: #111; color: #fff; font-weight: 800; font-size: 17px; display: flex; justify-content: center; align-items: center; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.25); transition: transform 0.2s; }
   .sheet-btn:active { transform: scale(0.98); }
 
   .loading-box { display: flex; justify-content: center; padding-top: 150px; color: #888; }
@@ -482,13 +496,11 @@ const htmlContent = `
                             {{ formatScheduleInfo(item) }}
                         </div>
 
-                        <!-- 胶囊条 -->
                         <div class="capsule-bar">
                             <div class="capsule-left">{{ formatDuration(item) }}</div>
                             <div class="capsule-right">{{ formatCapsuleRight(item) }}</div>
                         </div>
 
-                        <!-- 勾选图标 -->
                         <div class="check-mark"><i class="fas fa-check-circle"></i></div>
                     </div>
                 </div>
@@ -509,6 +521,7 @@ const htmlContent = `
         </div>
     </div>
 
+    <!-- 🔴 美化后的详情弹窗 -->
     <div v-if="selectedItem" class="modal-overlay" @click.self="selectedItem = null">
         <div class="detail-sheet">
             <div class="sheet-header">
@@ -517,11 +530,35 @@ const htmlContent = `
             </div>
             <div class="sheet-body">
                 <h2 class="sheet-title">{{ selectedItem.name || selectedItem.title }}</h2>
-                <div class="sheet-meta">
-                    <span class="meta-tag">{{ formatSubtitle(selectedItem) }}</span>
-                    <span class="meta-tag" v-if="selectedItem.runtime_real">{{ selectedItem.runtime_real }}分钟</span>
-                    <span class="meta-tag">TMDB {{ selectedItem.vote_average?.toFixed(1) }}</span>
+                
+                <!-- 评分栏 -->
+                <div class="rating-row">
+                    <!-- TMDB -->
+                    <div class="rating-badge tmdb">
+                        <img src="https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg" class="platform-logo">
+                        <i class="fas fa-star" style="color:#F5C518; font-size:11px;"></i>
+                        <span class="score-val">{{ selectedItem.vote_average?.toFixed(1) || '0.0' }}</span>
+                    </div>
+                    <!-- Popularity (Simulated Trakt) -->
+                    <div class="rating-badge trakt" v-if="selectedItem.vote_count">
+                        <img src="https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg" class="platform-logo">
+                        <i class="fas fa-heart" style="color:#ed1c24; font-size:11px;"></i>
+                        <span class="score-val" style="color:#333">{{ formatVotes(selectedItem.vote_count) }}</span>
+                    </div>
                 </div>
+
+                <!-- 题材标签 -->
+                <div class="genre-row" v-if="selectedItem.genres && selectedItem.genres.length">
+                    <span v-for="g in selectedItem.genres" :key="g.id" class="genre-pill">{{ g.name }}</span>
+                </div>
+                
+                <!-- 基础信息 -->
+                <div class="sheet-info-grid">
+                    <div class="info-item" v-if="selectedItem.runtime_real"><i class="far fa-clock"></i> {{ selectedItem.runtime_real }}分钟</div>
+                    <div class="info-item"><i class="far fa-calendar"></i> {{ (selectedItem.first_air_date || selectedItem.release_date || '').slice(0,4) }}</div>
+                    <div class="info-item">{{ formatSubtitle(selectedItem) }}</div>
+                </div>
+
                 <p class="sheet-overview">{{ selectedItem.overview || '暂无简介...' }}</p>
                 <div class="sheet-btn"><i class="fas fa-play"></i> 立即播放</div>
             </div>
@@ -536,8 +573,9 @@ const { createApp, ref, computed, onMounted, watch } = Vue;
 createApp({
     setup() {
         const TMDB_IMG = 'https://image.tmdb.org/t/p/';
-        const currentMainTab = ref('mine'); 
-        const currentSubTab = ref('watching');
+        // 🔴 默认打开发现页
+        const currentMainTab = ref('discover'); 
+        const currentSubTab = ref('trakt_hot');
         const filterType = ref('all'); 
         const loading = ref(false);
         const rawData = ref([]);
@@ -661,6 +699,13 @@ createApp({
             if(item.release_date) return item.release_date.slice(0,4);
             return '待定';
         };
+        
+        // 格式化观看人数 (1.2k)
+        const formatVotes = (num) => {
+            if(!num) return '0';
+            if(num > 1000) return (num/1000).toFixed(1) + 'k';
+            return num;
+        };
 
         const getPoster = (i) => i.poster_path ? TMDB_IMG + 'w200' + i.poster_path : 'https://via.placeholder.com/200x300/e0e0e0/ffffff?text=No+Poster';
         const getBackdrop = (i) => {
@@ -677,7 +722,7 @@ createApp({
             currentMainTab, switchMainTab, currentSubTab, subTabs, filterType,
             weekDays, selectedWeekDay,
             loading, processedList, getPageTitle, selectedItem, openModal,
-            getPoster, getBackdrop, formatSubtitle, formatDuration, formatScheduleInfo, formatCapsuleRight
+            getPoster, getBackdrop, formatSubtitle, formatDuration, formatScheduleInfo, formatCapsuleRight, formatVotes
         };
     }
 }).mount('#app-container');
