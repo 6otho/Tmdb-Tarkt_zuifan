@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (最终版：详情页评分UI美化 + 官方Logo + 题材标签)
+ * Cloudflare Worker 追番列表 (沉浸式终极版：全屏穿透 + 毛玻璃顶栏)
  * ==============================================================================
  */
 
@@ -127,7 +127,6 @@ async function hydrateTrakt(env, items, typeOverride) {
         if (!tmdbId) return null;
 
         try {
-            // 请求 TMDB 详情 (包含 Genres)
             const r = await fetch(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}?language=zh-CN`, { 
                 headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } 
             });
@@ -147,7 +146,7 @@ async function hydrateTrakt(env, items, typeOverride) {
             }
 
             return { 
-                ...d, // 这里的 d 包含了 genres, vote_average, vote_count 等
+                ...d, 
                 media_type: mediaType, 
                 trakt_type: typeOverride, 
                 air_time_iso: airTime, 
@@ -200,7 +199,7 @@ const htmlContent = `
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>Reflix</title>
+<title>TMDB&Trakt追新</title>
 <link rel="icon" type="image/png" href="https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
@@ -209,9 +208,12 @@ const htmlContent = `
 
 <style>
   :root {
-    --bg-app: #B4B9C2; 
+    /* 🔴 改为更干净的 iOS 系统灰，告别沉闷的深灰 */
+    --bg-app: #F2F4F6; 
     --bg-desktop: #202020;
     --accent-purple: #6D28D9; 
+    /* 毛玻璃顶栏背景色 */
+    --glass-header: rgba(242, 244, 246, 0.75); 
     --glass-nav: rgba(255, 255, 255, 0.75);
     --glass-border: rgba(255, 255, 255, 0.4);
     --tmdb-color: #0d253f;
@@ -226,18 +228,19 @@ const htmlContent = `
     background-color: var(--bg-app);
     -webkit-tap-highlight-color: transparent;
     overscroll-behavior: none;
-    position: fixed; left: 0; top: 0;
+    /* 解决Safari全屏回弹的关键 */
+    position: fixed; left: 0; top: 0; right: 0; bottom: 0;
   }
 
   #app-container {
     width: 100%; height: 100%;
-    position: absolute; inset: 0;
+    position: relative; /* 桌面端可能用到 absolute */
     background-color: var(--bg-app);
     display: flex; flex-direction: column;
     overflow: hidden;
-    padding-top: env(safe-area-inset-top); 
   }
 
+  /* 💻 桌面端适配 */
   @media (min-width: 768px) {
     body { 
         background-color: var(--bg-desktop); 
@@ -247,53 +250,64 @@ const htmlContent = `
     #app-container { 
         width: 100%; max-width: 430px; 
         height: 90vh; max-height: 880px; 
-        position: relative; inset: auto;
+        position: relative;
         border-radius: 44px; border: 8px solid #2a2a2a;
         box-shadow: 0 0 60px rgba(0,0,0,0.6);
-        padding-top: 10px;
+        /* 桌面端内部需要 relative 定位 */
+        overflow: hidden;
     }
   }
 
-  /* Header */
+  /* 🔴 顶部悬浮毛玻璃层 (新) */
+  .top-glass-bar {
+      position: absolute; top: 0; left: 0; right: 0;
+      z-index: 20;
+      background: var(--glass-header);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border-bottom: 1px solid rgba(0,0,0,0.05);
+      /* 适配刘海屏，自动延伸背景 */
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: 10px;
+  }
+
   .header-nav {
-    flex-shrink: 0; display: flex; justify-content: space-between; align-items: center;
+    display: flex; justify-content: space-between; align-items: center;
     padding: 8px 20px 4px 20px; 
-    background: transparent; z-index: 20;
   }
 
   .media-segment {
     display: flex; align-items: center;
-    background: rgba(230, 230, 230, 0.4); 
+    background: rgba(220, 220, 220, 0.5); 
     backdrop-filter: blur(10px);
     border-radius: 99px; padding: 3px;
     border: 1px solid rgba(255,255,255,0.4);
-    box-shadow: 0 4px 10px rgba(0,0,0,0.05);
   }
   .seg-btn {
     border-radius: 99px; padding: 6px 14px;
     display: flex; align-items: center; justify-content: center; gap: 6px;
-    color: #444; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); 
+    color: #555; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); 
     font-size: 13px; cursor: pointer;
     overflow: hidden; white-space: nowrap; font-weight: 600;
   }
   .seg-btn.active {
-    background: #C084FC; color: #fff;
-    box-shadow: 0 2px 8px rgba(192, 132, 252, 0.4);
+    background: #6D28D9; color: #fff; /* 统一主色调 */
+    box-shadow: 0 2px 8px rgba(109, 40, 217, 0.3);
   }
   
-  .page-header { flex-shrink: 0; padding: 0 20px 8px 20px; z-index: 10; }
-  .page-title { font-size: 26px; font-weight: 900; color: #1F2937; margin-bottom: 8px; letter-spacing: -0.5px; }
+  .page-header { padding: 0 20px; }
+  .page-title { font-size: 26px; font-weight: 900; color: #111; margin-bottom: 8px; letter-spacing: -0.5px; }
   
   .sub-tabs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
   .sub-tabs::-webkit-scrollbar { display: none; }
   .sub-pill {
     padding: 7px 14px; border-radius: 12px; font-size: 12px; font-weight: 700;
-    background: rgba(255,255,255,0.35); border: 1px solid rgba(255,255,255,0.3);
+    background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.5);
     color: #4B5563; white-space: nowrap; transition: all 0.2s; flex-shrink: 0;
   }
   .sub-pill.active {
     background: #fff; color: #000; border-color: #fff; transform: scale(1.03);
-    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.05);
   }
 
   .week-grid-tabs {
@@ -301,17 +315,23 @@ const htmlContent = `
   }
   .week-pill {
       padding: 7px 0; font-size: 12px; width: 100%; min-width: 0; text-align: center;
-      background: rgba(255,255,255,0.35); border-radius: 10px; font-weight: 700; color: #555;
+      background: rgba(255,255,255,0.5); border-radius: 10px; font-weight: 700; color: #555;
       transition: all 0.2s;
   }
-  .week-pill.active { background: #7C3AED; color: #fff; box-shadow: 0 3px 8px rgba(124, 58, 237, 0.3); }
+  .week-pill.active { background: #6D28D9; color: #fff; box-shadow: 0 3px 8px rgba(109, 40, 217, 0.3); }
 
-  /* Scroll Content */
+  /* 🔴 沉浸式滚动区域 (通顶设计) */
   .scroll-content {
-    flex: 1; overflow-y: auto; padding: 6px 16px; 
-    padding-bottom: calc(75px + env(safe-area-inset-bottom));
+    position: absolute; inset: 0; /* 铺满父容器 */
+    overflow-y: auto; 
+    padding: 0 16px;
+    /* 顶部 Padding = 顶部安全区 + 导航栏高度(约130px) + 额外空隙 */
+    padding-top: calc(env(safe-area-inset-top) + 145px);
+    /* 底部 Padding = 底部安全区 + Dock高度(56px) + 悬浮(8px) + 留白(10px) */
+    padding-bottom: calc(env(safe-area-inset-bottom) + 80px);
     -webkit-overflow-scrolling: touch;
     overscroll-behavior-y: contain;
+    z-index: 1; /* 在顶栏之下 */
   }
   .scroll-content::-webkit-scrollbar { display: none; }
   .list-container { display: flex; flex-direction: column; gap: 14px; }
@@ -320,10 +340,10 @@ const htmlContent = `
   .rich-card {
     position: relative; width: 100%; height: 135px;
     border-radius: 22px; overflow: hidden; background: #fff;
-    box-shadow: 0 6px 16px -4px rgba(0, 0, 0, 0.1);
+    /* 去掉边框，减少“盒子感”，只留阴影 */
+    box-shadow: 0 8px 20px -6px rgba(0, 0, 0, 0.08);
     display: flex; align-items: center; flex-shrink: 0;
     transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1); cursor: pointer;
-    border: 1px solid rgba(255,255,255,0.6);
   }
   .rich-card:active { transform: scale(0.97); }
 
@@ -331,7 +351,7 @@ const htmlContent = `
   .card-mask { position: absolute; inset: 0; background: linear-gradient(90deg, #EAECEF 28%, rgba(234,236,239,0.92) 55%, rgba(255,255,255,0.2) 100%); z-index: 1; }
   .card-body { position: relative; z-index: 2; width: 100%; height: 100%; display: flex; align-items: center; padding-left: 14px; }
 
-  .poster-thumb { width: 76px; height: 112px; border-radius: 12px; object-fit: cover; box-shadow: 0 5px 10px rgba(0,0,0,0.2); flex-shrink: 0; margin-right: 12px; background: #ccc; }
+  .poster-thumb { width: 76px; height: 112px; border-radius: 12px; object-fit: cover; box-shadow: 0 5px 10px rgba(0,0,0,0.15); flex-shrink: 0; margin-right: 12px; background: #e0e0e0; }
   .info-col { flex: 1; height: 112px; display: flex; flex-direction: column; padding-top: 4px; position: relative; min-width: 0; }
 
   .title-txt { font-size: 16px; font-weight: 900; color: #111; margin-bottom: 2px; line-height: 1.2; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; letter-spacing: -0.3px; }
@@ -340,16 +360,16 @@ const htmlContent = `
 
   .capsule-bar { 
       margin-bottom: 5px; width: 88%; height: 24px; 
-      background: rgba(0, 0, 0, 0.12);
+      background: rgba(0, 0, 0, 0.08); /* 更通透的灰 */
       border-radius: 99px; display: flex; align-items: center;
       position: relative; backdrop-filter: blur(10px);
-      padding: 2px; border: 1px solid rgba(255,255,255,0.1);
+      padding: 2px; border: 1px solid rgba(255,255,255,0.2);
   }
   .capsule-left { 
       background: #000; color: #fff; padding: 0 10px; height: 100%;
       display: flex; align-items: center; justify-content: center;
       font-size: 10px; font-weight: 800; border-radius: 99px; 
-      white-space: nowrap; z-index: 2; box-shadow: 2px 0 6px rgba(0,0,0,0.15);
+      white-space: nowrap; z-index: 2; box-shadow: 2px 0 6px rgba(0,0,0,0.1);
   }
   .capsule-right { 
       flex: 1; text-align: right; padding-right: 10px; color: #000; 
@@ -362,7 +382,7 @@ const htmlContent = `
       filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1)); z-index: 5;
   }
 
-  /* ================= Dock ================= */
+  /* ================= Dock (浮动 + 紧凑) ================= */
   .bottom-nav {
     position: absolute; left: 50%; transform: translateX(-50%);
     width: 92%; max-width: 380px; height: 56px;
@@ -372,7 +392,8 @@ const htmlContent = `
     border-radius: 99px; border: 1px solid var(--glass-border);
     box-shadow: 0 10px 25px rgba(0,0,0,0.12);
     display: flex; justify-content: space-evenly; align-items: center;
-    z-index: 50; bottom: calc(8px + env(safe-area-inset-bottom));
+    z-index: 50; 
+    bottom: calc(8px + env(safe-area-inset-bottom));
   }
   .nav-btn { 
       display: flex; flex-direction: column; align-items: center; justify-content: center; 
@@ -381,11 +402,11 @@ const htmlContent = `
   }
   .nav-btn i { font-size: 20px; transition: transform 0.3s; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.05)); } 
   .nav-btn.active { color: #000; }
-  .nav-btn.active i { transform: translateY(-2px) scale(1.1); color: #7C3AED; filter: drop-shadow(0 3px 6px rgba(124, 58, 237, 0.25)); }
+  .nav-btn.active i { transform: translateY(-2px) scale(1.1); color: #6D28D9; filter: drop-shadow(0 3px 6px rgba(109, 40, 217, 0.25)); }
   .user-avatar { width: 24px; height: 24px; border-radius: 50%; background: #ccc; border: 2px solid transparent; transition: all 0.3s; box-shadow: 0 2px 5px rgba(0,0,0,0.15); }
-  .nav-btn.active .user-avatar { border-color: #7C3AED; transform: translateY(-2px) scale(1.05); }
+  .nav-btn.active .user-avatar { border-color: #6D28D9; transform: translateY(-2px) scale(1.05); }
 
-  /* ================= 🔴 Detail Sheet (美化版) ================= */
+  /* ================= Detail Sheet ================= */
   .modal-overlay { position: absolute; inset: 0; z-index: 100; background: rgba(0,0,0,0.3); backdrop-filter: blur(6px); display: flex; align-items: flex-end; transition: opacity 0.3s; }
   @media (max-width: 1024px) { .modal-overlay { position: fixed; bottom: 0; left: 0; right: 0; top: 0; } }
   
@@ -404,79 +425,70 @@ const htmlContent = `
   .sheet-close { position: absolute; top: 16px; right: 16px; width: 34px; height: 34px; border-radius: 50%; background: rgba(0,0,0,0.5); color: #fff; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(15px); cursor: pointer; border: 1px solid rgba(255,255,255,0.2); }
   
   .sheet-body { padding: 0 24px 20px 24px; overflow-y: auto; margin-top: -40px; position: relative; z-index: 2; }
-  
-  /* 🔴 标题加大 */
   .sheet-title { font-size: 28px; font-weight: 900; line-height: 1.1; margin-bottom: 16px; color: #111; letter-spacing: -0.5px; text-shadow: 0 20px 40px #fff; }
   
-  /* 🔴 评分栏 (新) */
   .rating-row { display: flex; gap: 12px; margin-bottom: 16px; align-items: center; }
-  .rating-badge { 
-      display: flex; align-items: center; gap: 6px; 
-      padding: 6px 12px; border-radius: 12px; 
-      font-size: 13px; font-weight: 800;
-  }
+  .rating-badge { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 12px; font-size: 13px; font-weight: 800; }
   .rating-badge.tmdb { background: rgba(13, 37, 63, 0.08); color: var(--tmdb-color); }
   .rating-badge.trakt { background: rgba(237, 28, 36, 0.08); color: var(--trakt-color); }
-  
   .platform-logo { height: 14px; width: auto; }
-  .score-val { font-size: 15px; }
-
-  /* 🔴 题材标签栏 (新) */
+  
   .genre-row { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 20px; padding-bottom: 4px; }
   .genre-row::-webkit-scrollbar { display: none; }
-  .genre-pill {
-      flex-shrink: 0; padding: 4px 10px; border-radius: 8px; 
-      border: 1px solid rgba(0,0,0,0.1); color: #666; 
-      font-size: 11px; font-weight: 600; background: #fff;
-  }
+  .genre-pill { flex-shrink: 0; padding: 4px 10px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.1); color: #666; font-size: 11px; font-weight: 600; background: #fff; }
   
   .sheet-info-grid { display: flex; gap: 15px; margin-bottom: 20px; font-size: 13px; color: #555; font-weight: 600; }
   .info-item { display: flex; align-items: center; gap: 5px; }
 
   .sheet-overview { font-size: 16px; line-height: 1.6; color: #333; margin-bottom: 30px; font-weight: 400; opacity: 0.9; }
-  
   .sheet-btn { width: 100%; padding: 16px; border-radius: 18px; background: #111; color: #fff; font-weight: 800; font-size: 17px; display: flex; justify-content: center; align-items: center; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.25); transition: transform 0.2s; }
   .sheet-btn:active { transform: scale(0.98); }
 
-  .loading-box { display: flex; justify-content: center; padding-top: 150px; color: #888; }
+  .loading-box { display: flex; justify-content: center; padding-top: 200px; color: #888; }
 </style>
 </head>
 <body>
 
 <div id="app-container">
     
-    <div class="header-nav">
-        <div class="media-segment">
-            <div @click="filterType = 'all'" :class="['seg-btn', filterType === 'all' ? 'active' : '']">
-                <i class="fas fa-layer-group"></i><span v-if="filterType === 'all'">媒体库</span>
+    <!-- 🔴 1. 顶部悬浮毛玻璃容器 -->
+    <div class="top-glass-bar">
+        <!-- 导航开关 -->
+        <div class="header-nav">
+            <div class="media-segment">
+                <div @click="filterType = 'all'" :class="['seg-btn', filterType === 'all' ? 'active' : '']">
+                    <i class="fas fa-layer-group"></i><span v-if="filterType === 'all'">媒体库</span>
+                </div>
+                <div @click="filterType = 'tv'" :class="['seg-btn', filterType === 'tv' ? 'active' : '']">
+                    <i class="fas fa-tv"></i><span v-if="filterType === 'tv'">电视剧</span>
+                </div>
+                <div @click="filterType = 'movie'" :class="['seg-btn', filterType === 'movie' ? 'active' : '']">
+                    <i class="fas fa-film"></i><span v-if="filterType === 'movie'">电影</span>
+                </div>
             </div>
-            <div @click="filterType = 'tv'" :class="['seg-btn', filterType === 'tv' ? 'active' : '']">
-                <i class="fas fa-tv"></i><span v-if="filterType === 'tv'">电视剧</span>
+            <div style="width:24px;"></div> 
+        </div>
+
+        <!-- 标题与标签 -->
+        <div class="page-header">
+            <h2 class="page-title">{{ getPageTitle() }}</h2>
+            
+            <div class="week-grid-tabs" v-if="currentMainTab === 'schedule'">
+                 <button v-for="(d, idx) in weekDays" :key="idx" 
+                    @click="selectedWeekDay = idx"
+                    :class="['week-pill', selectedWeekDay === idx ? 'active' : '']">
+                    {{ d }}
+                 </button>
             </div>
-            <div @click="filterType = 'movie'" :class="['seg-btn', filterType === 'movie' ? 'active' : '']">
-                <i class="fas fa-film"></i><span v-if="filterType === 'movie'">电影</span>
+            
+            <div class="sub-tabs" v-else>
+                <button v-for="tab in subTabs" :key="tab.key" @click="currentSubTab = tab.key" 
+                    :class="['sub-pill', currentSubTab === tab.key ? 'active' : '']">{{ tab.name }}</button>
             </div>
         </div>
-        <div style="width:24px;"></div> 
     </div>
 
-    <div class="page-header">
-        <h2 class="page-title">{{ getPageTitle() }}</h2>
-        
-        <div class="week-grid-tabs" v-if="currentMainTab === 'schedule'">
-             <button v-for="(d, idx) in weekDays" :key="idx" 
-                @click="selectedWeekDay = idx"
-                :class="['week-pill', selectedWeekDay === idx ? 'active' : '']">
-                {{ d }}
-             </button>
-        </div>
-        
-        <div class="sub-tabs" v-else>
-            <button v-for="tab in subTabs" :key="tab.key" @click="currentSubTab = tab.key" 
-                :class="['sub-pill', currentSubTab === tab.key ? 'active' : '']">{{ tab.name }}</button>
-        </div>
-    </div>
-
+    <!-- 🔴 2. 内容列表 (通顶布局，被遮挡部分通过 padding 处理) -->
     <div class="scroll-content">
         <div v-if="loading" class="loading-box"><i class="fas fa-circle-notch fa-spin fa-2x"></i></div>
         <div v-else class="list-container">
@@ -509,6 +521,7 @@ const htmlContent = `
         </div>
     </div>
 
+    <!-- 3. 底部 Dock -->
     <div class="bottom-nav">
         <div @click="switchMainTab('discover')" :class="['nav-btn', currentMainTab === 'discover' ? 'active' : '']">
             <i class="far fa-compass"></i><span>发现</span>
@@ -521,7 +534,7 @@ const htmlContent = `
         </div>
     </div>
 
-    <!-- 🔴 美化后的详情弹窗 -->
+    <!-- 4. 详情弹窗 -->
     <div v-if="selectedItem" class="modal-overlay" @click.self="selectedItem = null">
         <div class="detail-sheet">
             <div class="sheet-header">
@@ -531,15 +544,12 @@ const htmlContent = `
             <div class="sheet-body">
                 <h2 class="sheet-title">{{ selectedItem.name || selectedItem.title }}</h2>
                 
-                <!-- 评分栏 -->
                 <div class="rating-row">
-                    <!-- TMDB -->
                     <div class="rating-badge tmdb">
                         <img src="https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg" class="platform-logo">
                         <i class="fas fa-star" style="color:#F5C518; font-size:11px;"></i>
                         <span class="score-val">{{ selectedItem.vote_average?.toFixed(1) || '0.0' }}</span>
                     </div>
-                    <!-- Popularity (Simulated Trakt) -->
                     <div class="rating-badge trakt" v-if="selectedItem.vote_count">
                         <img src="https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg" class="platform-logo">
                         <i class="fas fa-heart" style="color:#ed1c24; font-size:11px;"></i>
@@ -547,12 +557,10 @@ const htmlContent = `
                     </div>
                 </div>
 
-                <!-- 题材标签 -->
                 <div class="genre-row" v-if="selectedItem.genres && selectedItem.genres.length">
                     <span v-for="g in selectedItem.genres" :key="g.id" class="genre-pill">{{ g.name }}</span>
                 </div>
                 
-                <!-- 基础信息 -->
                 <div class="sheet-info-grid">
                     <div class="info-item" v-if="selectedItem.runtime_real"><i class="far fa-clock"></i> {{ selectedItem.runtime_real }}分钟</div>
                     <div class="info-item"><i class="far fa-calendar"></i> {{ (selectedItem.first_air_date || selectedItem.release_date || '').slice(0,4) }}</div>
@@ -573,7 +581,6 @@ const { createApp, ref, computed, onMounted, watch } = Vue;
 createApp({
     setup() {
         const TMDB_IMG = 'https://image.tmdb.org/t/p/';
-        // 🔴 默认打开发现页
         const currentMainTab = ref('discover'); 
         const currentSubTab = ref('trakt_hot');
         const filterType = ref('all'); 
@@ -700,7 +707,6 @@ createApp({
             return '待定';
         };
         
-        // 格式化观看人数 (1.2k)
         const formatVotes = (num) => {
             if(!num) return '0';
             if(num > 1000) return (num/1000).toFixed(1) + 'k';
@@ -711,7 +717,7 @@ createApp({
         const getBackdrop = (i) => {
             if (i.episode_image) return TMDB_IMG + 'w780' + i.episode_image;
             if (i.backdrop_path) return TMDB_IMG + 'w780' + i.backdrop_path;
-            return 'https://via.placeholder.com/600x340/e0e0e0/ffffff?text=Reflix';
+            return 'https://via.placeholder.com/600x340/e0e0e0/ffffff?text=TMDB&Trakt追新';
         };
         
         const openModal = (item) => { selectedItem.value = item; };
