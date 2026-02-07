@@ -1,600 +1,533 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (KV智能缓存 + Reflix伪装版)
- * 
- * 部署说明：
- * 1. 在 CF 后台 Settings -> Variables -> KV Namespace Bindings 中：
- *    - Variable name 填: KV
- *    - KV Namespace 选: ANIME_KV (或者你创建的那个名字)
- * 2. 在下方配置区填入三个 Key
+ * Cloudflare Worker 追番列表 (iPhone 14/全面屏 完美紧凑适配版)
  * ==============================================================================
  */
 
-// ============================================
-// 🔴 必填：配置区 (请在此处填入你的密钥)
-// ============================================
-const TMDB_TOKEN = "eyJhbGciOiJIUz..."; // 👈 这里填第一步获取的 TMDB 长 Token
-const TRAKT_CLIENT_ID = "609ff...";       // 👈 这里填第二步获取的 Client ID
-const TRAKT_ACCESS_TOKEN = "95e77..."; // 👈 这里填第三步获取的 Access Token
+// 🔵 缓存配置
+const TTL_LONG = 3600;
+const TTL_SHORT = 60;
 
-// 🔵 智能缓存时间配置 (单位：秒)
-const TTL_LONG = 3600;  // 公共数据(热门/新番表)缓存 1小时 -> 加速加载
-const TTL_SHORT = 60;   // 个人数据(历史/收藏)缓存 1分钟 -> 保证观看记录同步及时
-
-// 🔵 Reflix 伪装头 (保持 Trakt VIP 数据效果)
+// 🔵 伪装头
 const REFLIX_HEADERS = {
     'Content-Type': 'application/json',
     'trakt-api-version': '2',
-    'trakt-api-key': TRAKT_CLIENT_ID,
     'User-Agent': 'Reflix/2.1.0 (iPad; iOS 16.1; Scale/2.00)',
     'Accept': '*/*'
 };
-const TRAKT_AUTH_HEADERS = { ...REFLIX_HEADERS, 'Authorization': `Bearer ${TRAKT_ACCESS_TOKEN}` };
 
-// ================= 主逻辑入口 =================
+// ================= 🚀 后端逻辑 =================
 export default {
     async fetch(request, env, ctx) {
-      const url = new URL(request.url);
-  
-      // 检查 KV 是否绑定成功
-      if (!env.KV) {
-          console.warn("⚠️ 警告：未检测到名为 'KV' 的绑定变量。缓存功能将失效，请检查 Cloudflare 设置。");
-      }
-  
-      // API 路由分发 (套用智能缓存)
-      // 1. 个人数据 -> 使用短缓存 (TTL_SHORT)
-      if (url.pathname === '/api/user/calendar') return handleSmartCache(env, ctx, 'calendar', TTL_SHORT, handleTraktCalendar);
-      if (url.pathname === '/api/user/favs') return handleSmartCache(env, ctx, 'favs', TTL_SHORT, handleUserFavs);
-      if (url.pathname === '/api/user/history') return handleSmartCache(env, ctx, 'history', TTL_SHORT, handleTraktHistory);
-      if (url.pathname === '/api/user/watchlist') return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, handleTraktWatchlist);
-      
-      // 2. 公共数据 -> 使用长缓存 (TTL_LONG)
-      if (url.pathname === '/api/list') {
-          const tab = url.searchParams.get('tab') || 'schedule';
-          // 为不同列表生成不同的缓存 Key，例如 list_hot, list_schedule
-          return handleSmartCache(env, ctx, `list_${tab}`, TTL_LONG, () => handleListRequest(url.searchParams));
-      }
-      
-      // 3. 手动清除缓存 (预留接口)
-      if (url.pathname === '/flush') {
-          return new Response("缓存机制已设为自动过期。如需强制刷新，请在 Cloudflare 后台 KV 处手动删除 Key。", {status: 200});
-      }
-  
-      // 默认返回前端页面
-      return new Response(htmlContent, { headers: { 'content-type': 'text/html;charset=UTF-8' } });
+        const url = new URL(request.url);
+
+        if (!env.KV || !env.TRAKT_ID || !env.TRAKT_SECRET) {
+            return new Response("❌ 配置错误：请检查 Cloudflare 后台 Variables 设置。", {status: 500});
+        }
+
+        try {
+            if (url.pathname === '/api/user/calendar') 
+                return handleSmartCache(env, ctx, 'calendar', TTL_SHORT, () => handleTraktRequest(env, 'calendars/my/shows', 14));
+            if (url.pathname === '/api/user/favs') 
+                return handleSmartCache(env, ctx, 'favs', TTL_SHORT, () => handleUserFavs(env));
+            if (url.pathname === '/api/user/history') 
+                return handleSmartCache(env, ctx, 'history', TTL_SHORT, () => handleTraktRequest(env, 'sync/history', 20));
+            if (url.pathname === '/api/user/watchlist') 
+                return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, () => handleTraktRequest(env, 'sync/watchlist'));
+            if (url.pathname === '/api/list') {
+                const tab = url.searchParams.get('tab') || 'schedule';
+                return handleSmartCache(env, ctx, `list_${tab}`, TTL_LONG, () => handleListRequest(env, url.searchParams));
+            }
+            if (url.pathname === '/flush') {
+                const tokenData = await env.KV.get('TRAKT_AUTH');
+                return new Response(`KV状态: ${tokenData ? '✅ 已存储' : '⚠️ 未初始化'}`, {status: 200});
+            }
+
+            return new Response(htmlContent, { headers: { 'content-type': 'text/html;charset=UTF-8' } });
+
+        } catch (e) {
+            return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+        }
     },
 };
 
-// ================= 🧠 智能缓存核心函数 =================
-async function handleSmartCache(env, ctx, key, ttl, fetchFunction) {
-    // 如果没有绑定 KV，直接请求源站，不走缓存逻辑
-    if (!env.KV) return fetchFunction();
-
-    // 1. 尝试从 KV 读取缓存
-    const cached = await env.KV.get(key);
-    if (cached) {
-        // 如果有缓存，直接返回，并加上标记头 X-Cache: HIT
-        return new Response(cached, { 
-            headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' } 
-        });
+// --- Token 管理 ---
+async function getValidAccessToken(env) {
+    let authData = await env.KV.get('TRAKT_AUTH', { type: 'json' });
+    if (!authData) {
+        if (env.TRAKT_INIT_REFRESH) return await refreshTraktToken(env, env.TRAKT_INIT_REFRESH);
+        throw new Error("环境变量 TRAKT_INIT_REFRESH 未填写");
     }
-
-    // 2. 没有缓存，执行原函数去请求 Trakt/TMDB
-    const response = await fetchFunction();
-    
-    // 3. 只有当请求成功 (状态码 200) 时才写入缓存
-    if (response.status === 200) {
-        // 复制一份数据用于存储 (因为 response body 只能读一次)
-        const data = await response.clone().text();
-        
-        // 异步写入 KV，不阻塞当前请求返回
-        ctx.waitUntil(env.KV.put(key, data, { expirationTtl: ttl })); 
+    const now = Math.floor(Date.now() / 1000);
+    if (now > (authData.created_at + authData.expires_in - 600)) {
+        return await refreshTraktToken(env, authData.refresh_token);
     }
-
-    return response;
+    return authData.access_token;
 }
 
-// ================= 🧱 后端业务逻辑 =================
+async function refreshTraktToken(env, refreshToken) {
+    const res = await fetch('https://api.trakt.tv/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            refresh_token: refreshToken,
+            client_id: env.TRAKT_ID,
+            client_secret: env.TRAKT_SECRET,
+            redirect_uri: 'urn:ietf:wg:oauth:2.0:oob',
+            grant_type: 'refresh_token'
+        })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(`刷新失败: ${data.error_description}`);
+    await env.KV.put('TRAKT_AUTH', JSON.stringify(data));
+    return data.access_token;
+}
 
-// 通用工具：Trakt 数据转 TMDB 数据 (补充图片 + 时间处理)
-async function hydrateTrakt(items, typeOverride) {
+async function handleSmartCache(env, ctx, key, ttl, fetcher) {
+    if (!env.KV) return fetcher();
+    const cached = await env.KV.get(key);
+    if (cached) return new Response(cached, { headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' } });
+    const res = await fetcher();
+    if (res.status === 200) ctx.waitUntil(env.KV.put(key, await res.clone().text(), { expirationTtl: ttl }));
+    return res;
+}
+
+async function handleTraktRequest(env, path, limit) {
+    const token = await getValidAccessToken(env);
+    const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
+    let url = `https://api.trakt.tv/${path}`;
+    
+    if (path.includes('calendars')) url = `${url}/${new Date().toISOString().split('T')[0]}/${limit}`;
+    else if (path.includes('history')) url += `?limit=${limit}`;
+    else if (path.includes('watchlist')) url += `?sort=added,asc`;
+
+    const res = await fetch(url, { headers });
+    const data = await res.json();
+    const hydrated = await hydrateTrakt(env, data, path.includes('calendar') ? 'calendar' : (path.includes('watchlist') ? 'watchlist' : 'history'));
+    
+    if (path.includes('history')) {
+        const seen = new Set();
+        return new Response(JSON.stringify(hydrated.filter(i => !seen.has(i.id) && seen.add(i.id))), { headers: {'Content-Type': 'application/json'} });
+    }
+    return new Response(JSON.stringify(hydrated), { headers: {'Content-Type': 'application/json'} });
+}
+
+async function hydrateTrakt(env, items, typeOverride) {
     const promises = items.map(async (item) => {
-        let tmdbId, mediaType, airTimeStr;
+        let tmdbId, mediaType, airTime;
+        if (item.first_aired) airTime = item.first_aired;
+        if (item.watched_at) airTime = item.watched_at;
         
-        // 提取时间
-        if (item.first_aired) airTimeStr = item.first_aired;
-
-        // 提取 ID 和 类型
         if (item.show) { tmdbId = item.show.ids.tmdb; mediaType = 'tv'; }
         else if (item.movie) { tmdbId = item.movie.ids.tmdb; mediaType = 'movie'; }
         else if (item.type === 'show') { tmdbId = item.show.ids.tmdb; mediaType = 'tv'; }
         else if (item.type === 'movie') { tmdbId = item.movie.ids.tmdb; mediaType = 'movie'; }
+        else { tmdbId = item.id; mediaType = item.media_type || 'tv'; }
         
-        if (!tmdbId) return null; // 没有 TMDB ID 无法获取图片，跳过
+        if (!tmdbId) return null;
 
         try {
-            // 请求 TMDB 获取中文信息和图片
             const r = await fetch(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}?language=zh-CN`, { 
-                headers: { 'Authorization': `Bearer ${TMDB_TOKEN}` } 
+                headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } 
             });
             const d = await r.json();
             
-            // 合并数据
+            let episodeStill = null;
+            if (mediaType === 'tv' && item.episode) {
+                const s = item.episode.season;
+                const e = item.episode.number;
+                try {
+                    const epRes = await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}/season/${s}/episode/${e}?language=zh-CN`, {
+                        headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` }
+                    });
+                    const epData = await epRes.json();
+                    if(epData.still_path) episodeStill = epData.still_path;
+                } catch(err) {}
+            }
+
             return { 
                 ...d, 
                 media_type: mediaType, 
-                trakt_type: typeOverride,
-                air_time_iso: airTimeStr, // 保留 Trakt 的准确播出时间
-                episode_info: item.episode // 保留集数信息
+                trakt_type: typeOverride, 
+                air_time_iso: airTime, 
+                episode_info: item.episode, 
+                runtime_real: d.runtime || (d.episode_run_time ? d.episode_run_time[0] : null),
+                episode_image: episodeStill,
+                next_ep_date: d.next_episode_to_air ? d.next_episode_to_air.air_date : null,
+                last_ep_date: d.last_air_date,
+                total_seasons: d.number_of_seasons,
+                total_episodes: d.number_of_episodes,
+                status: d.status
             }; 
         } catch { return null; }
     });
-    
-    // 等待所有请求完成并过滤无效项
-    const results = await Promise.all(promises);
-    return results.filter(i => i !== null);
+    return (await Promise.all(promises)).filter(i => i !== null);
 }
 
-// 1. 个人追番周历 (Trakt)
-async function handleTraktCalendar() {
-    try {
-        const today = new Date().toISOString().split('T')[0];
-        // 获取未来 7 天的个人日历
-        const res = await fetch(`https://api.trakt.tv/calendars/my/shows/${today}/7`, { headers: TRAKT_AUTH_HEADERS });
-        const data = await res.json();
-        const hydrated = await hydrateTrakt(data, 'calendar');
-        return new Response(JSON.stringify(hydrated), { headers: {'Content-Type': 'application/json'} });
-    } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
-}
-
-// 2. 新番时刻 (公共日漫日历 - Trakt)
-async function handlePublicAnimeCalendar() {
-    try {
-        const today = new Date().toISOString().split('T')[0];
-        // 获取 Trakt 公共日历 (未来3天)，带 extended 信息以便过滤
-        const res = await fetch(`https://api.trakt.tv/calendars/all/shows/${today}/3?extended=full`, { headers: REFLIX_HEADERS });
-        const data = await res.json();
-        
-        // ⚡️ 核心过滤：只保留 日本(jp) 且 类型包含动画(anime) 的条目
-        const animeItems = data.filter(i => {
-            const country = i.show?.country || '';
-            const genres = i.show?.genres || [];
-            return (country === 'jp') && (genres.includes('anime') || genres.includes('animation'));
-        });
-
-        const hydrated = await hydrateTrakt(animeItems, 'schedule');
-        return new Response(JSON.stringify(hydrated), { headers: {'Content-Type': 'application/json'} });
-    } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
-}
-
-// 3. Trakt 历史记录
-async function handleTraktHistory() {
-    try {
-        const res = await fetch('https://api.trakt.tv/sync/history?limit=20', { headers: TRAKT_AUTH_HEADERS });
-        const data = await res.json();
-        const hydrated = await hydrateTrakt(data, 'history');
-        // 去重
-        const seen = new Set();
-        return new Response(JSON.stringify(hydrated.filter(i => { if(seen.has(i.id)) return false; seen.add(i.id); return true; })), { headers: {'Content-Type': 'application/json'} });
-    } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
-}
-
-// 4. Trakt 待看列表 (Watchlist)
-async function handleTraktWatchlist() {
-    try {
-        const res = await fetch('https://api.trakt.tv/sync/watchlist?sort=added,asc', { headers: TRAKT_AUTH_HEADERS });
-        const data = await res.json();
-        const hydrated = await hydrateTrakt(data, 'watchlist');
-        return new Response(JSON.stringify(hydrated), { headers: {'Content-Type': 'application/json'} });
-    } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
-}
-
-// 5. TMDB 收藏 (Fallback)
-async function handleUserFavs() {
-  try {
-    const accRes = await fetch('https://api.themoviedb.org/3/account', { headers: { 'Authorization': `Bearer ${TMDB_TOKEN}` } });
-    const accData = await accRes.json();
-    const [tvRes, movieRes] = await Promise.all([
-      fetch(`https://api.themoviedb.org/3/account/${accData.id}/favorite/tv?language=zh-CN&sort_by=created_at.desc`, { headers: { 'Authorization': `Bearer ${TMDB_TOKEN}` } }),
-      fetch(`https://api.themoviedb.org/3/account/${accData.id}/favorite/movies?language=zh-CN&sort_by=created_at.desc`, { headers: { 'Authorization': `Bearer ${TMDB_TOKEN}` } })
-    ]);
-    const combined = [
-      ...(await tvRes.json()).results.map(i => ({...i, media_type: 'tv'})),
-      ...(await movieRes.json()).results.map(i => ({...i, media_type: 'movie'}))
-    ];
-    return new Response(JSON.stringify(combined), { headers: {'Content-Type': 'application/json'} });
-  } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
-}
-
-// 6. 公共列表路由 (热门/趋势)
-async function handleListRequest(params) {
-  const tab = params.get('tab') || 'schedule';
-  const commonQ = { language: 'zh-CN', include_adult: 'false', with_genres: '16', with_original_language: 'ja', without_genres: '10763,10764' };
-
-  try {
+async function handleListRequest(env, params) {
+    const tab = params.get('tab') || 'schedule';
+    const publicHeaders = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID };
     let results = [];
     if (tab === 'schedule') {
-        // 🔥 新番时刻
-        return handlePublicAnimeCalendar();
+        const today = new Date().toISOString().split('T')[0];
+        const res = await fetch(`https://api.trakt.tv/calendars/all/shows/${today}/7?extended=full`, { headers: publicHeaders });
+        const data = await res.json();
+        const anime = data.filter(i => (i.show?.country === 'jp') && (i.show?.genres?.includes('anime') || i.show?.genres?.includes('animation')));
+        results = await hydrateTrakt(env, anime, 'schedule');
     } else if (tab === 'trakt_hot') {
-        // 🔥 Trakt 热门 (Reflix源)
-         const [s, m] = await Promise.all([
-            fetch('https://api.trakt.tv/shows/trending?limit=10', { headers: REFLIX_HEADERS }),
-            fetch('https://api.trakt.tv/movies/trending?limit=10', { headers: REFLIX_HEADERS })
-        ]);
-        const combined = [...(await s.json()), ...(await m.json())].sort((a,b)=>b.watchers-a.watchers);
-        results = await hydrateTrakt(combined, 'trending');
-    } else if (tab === 'hot') {
-        // TMDB 热门
-        const [movieRes, tvRes] = await Promise.all([
-            fetch(`https://api.themoviedb.org/3/discover/movie?${new URLSearchParams({...commonQ, sort_by: 'popularity.desc', 'vote_count.gte': '50', page: '1'})}`, { headers: { 'Authorization': `Bearer ${TMDB_TOKEN}` } }),
-            fetch(`https://api.themoviedb.org/3/discover/tv?${new URLSearchParams({...commonQ, sort_by: 'popularity.desc', 'vote_count.gte': '50', page: '1'})}`, { headers: { 'Authorization': `Bearer ${TMDB_TOKEN}` } })
-        ]);
-        results = [
-            ...(await movieRes.json()).results.map(i => ({...i, media_type: 'movie'})),
-            ...(await tvRes.json()).results.map(i => ({...i, media_type: 'tv'}))
-        ].sort((a, b) => b.popularity - a.popularity);
+        const res = await fetch('https://api.trakt.tv/shows/trending?limit=10', { headers: publicHeaders });
+        results = await hydrateTrakt(env, await res.json(), 'trending');
     } else {
-        // TMDB 高分
-        const res = await fetch(`https://api.themoviedb.org/3/discover/tv?${new URLSearchParams({ ...commonQ, sort_by: 'vote_average.desc', 'vote_count.gte': '300', page: '1' })}`, { headers: { 'Authorization': `Bearer ${TMDB_TOKEN}` } });
-        results = (await res.json()).results || [];
+        const r = await fetch(`https://api.themoviedb.org/3/trending/all/week?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
+        results = (await r.json()).results;
     }
-    const seen = new Set();
-    return new Response(JSON.stringify({ results: results.filter(i => { if(seen.has(i.id)) return false; seen.add(i.id); return true; }) }), { headers: { 'Content-Type': 'application/json' }});
-  } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
+    return new Response(JSON.stringify(results), { headers: {'Content-Type': 'application/json'} });
 }
 
-// ================= 🎨 前端 Vue 代码 (HTML字符串) =================
+async function handleUserFavs(env) {
+    const headers = { 'Authorization': `Bearer ${env.TMDB_TOKEN}` };
+    const acc = await (await fetch('https://api.themoviedb.org/3/account', { headers })).json();
+    const tv = await (await fetch(`https://api.themoviedb.org/3/account/${acc.id}/favorite/tv?language=zh-CN&sort_by=created_at.desc`, { headers })).json();
+    const detailedList = await hydrateTrakt(env, tv.results.map(i => ({...i, media_type: 'tv'})), 'favs');
+    return new Response(JSON.stringify(detailedList), { headers: {'Content-Type': 'application/json'} });
+}
+
+// ================= 🎨 前端 Vue UI =================
 const htmlContent = `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>我的追番</title>
+<title>TMDB&Trakt iOS26</title>
+<link rel="icon" type="image/png" href="https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap" rel="stylesheet">
+
 <style>
   :root {
-    --bg-body: #000000;
-    --bg-gradient: linear-gradient(160deg, #1a1b2e 0%, #0d0d12 100%);
-    --glass-bg: rgba(30, 30, 35, 0.4);
-    --glass-border: rgba(255, 255, 255, 0.08);
-    --glass-highlight: rgba(255, 255, 255, 0.15);
-    --glass-shadow: 0 8px 32px -4px rgba(0, 0, 0, 0.6);
-    --text-main: #ffffff;
-    --text-sub: #9ca3af;
-    --accent-blue: #4f8aff;
-    --nav-bg: rgba(20, 20, 22, 0.75);
-    --max-width: 450px;
-    --pill-bg: rgba(255, 255, 255, 0.1);
-  }
-  
-  .light-mode {
-    --bg-body: #eef1f5;
-    --bg-gradient: linear-gradient(160deg, #f0f2f5 0%, #e0e5ec 100%);
-    --glass-bg: rgba(255, 255, 255, 0.65);
-    --glass-border: rgba(255, 255, 255, 0.6);
-    --glass-highlight: rgba(255, 255, 255, 0.9);
-    --glass-shadow: 0 10px 40px -10px rgba(100, 110, 140, 0.2);
-    --text-main: #1d1d1f;
-    --text-sub: #6e6e73;
-    --accent-blue: #0071e3;
-    --nav-bg: rgba(255, 255, 255, 0.7);
-    --pill-bg: rgba(255, 255, 255, 0.5);
+    --bg-app: #B4B9C2; 
+    --bg-desktop: #202020;
+    --accent-purple: #6D28D9; 
+    --glass-nav: rgba(255, 255, 255, 0.75);
+    --glass-border: rgba(255, 255, 255, 0.4);
   }
 
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", sans-serif;
-    background-color: var(--bg-body);
-    color: var(--text-main);
-    display: flex; justify-content: center;
-    min-height: 100vh; margin: 0;
-    touch-action: pan-y; 
+  /* 🔴 全局锁定，禁止回弹 */
+  html, body {
+    width: 100%; height: 100%;
+    margin: 0; padding: 0;
+    overflow: hidden; 
+    font-family: 'Roboto', sans-serif;
+    background-color: var(--bg-app);
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+    position: fixed; 
+    left: 0; top: 0;
   }
 
   #app-container {
-    width: 100%; max-width: var(--max-width);
-    background: var(--bg-gradient);
-    min-height: 100vh; position: relative;
-    box-shadow: 0 0 50px rgba(0,0,0,0.3);
-    padding-bottom: 110px;
-    transition: background 0.5s ease;
-  }
-  .hide-scroll::-webkit-scrollbar { display: none; }
-
-  /* 3D 玻璃通用类 */
-  .glass-3d {
-    background: var(--glass-bg);
-    backdrop-filter: blur(25px); -webkit-backdrop-filter: blur(25px);
-    border: 1px solid var(--glass-border);
-    border-top-color: var(--glass-highlight);
-    border-left-color: var(--glass-highlight);
-    box-shadow: var(--glass-shadow);
+    width: 100%; height: 100%;
+    position: absolute; inset: 0;
+    background-color: var(--bg-app);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    /* 🔴 顶部安全距离适配：利用 padding 顶开刘海 */
+    padding-top: env(safe-area-inset-top); 
   }
 
-  /* 胶囊按钮 */
-  .pill-btn {
-    background: var(--glass-bg); color: var(--text-sub);
-    padding: 8px 18px; border-radius: 99px;
-    font-size: 13px; font-weight: 600; 
-    border: 1px solid var(--glass-border);
-    transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+  @media (min-width: 768px) {
+    body { 
+        background-color: var(--bg-desktop); 
+        display: flex; justify-content: center; align-items: center;
+        position: static; 
+    }
+    #app-container { 
+        width: 100%; max-width: 430px; 
+        height: 90vh; max-height: 880px; 
+        position: relative; inset: auto;
+        border-radius: 44px; border: 8px solid #2a2a2a;
+        box-shadow: 0 0 60px rgba(0,0,0,0.6);
+        padding-top: 10px; /* 桌面端稍微给点顶距 */
+    }
+  }
+
+  /* Header 紧贴顶部 */
+  .header-nav {
+    flex-shrink: 0; display: flex; justify-content: space-between; align-items: center;
+    /* 减少上下 padding，让元素更靠上 */
+    padding: 8px 20px 4px 20px; 
+    background: transparent; z-index: 20;
+  }
+
+  .media-segment {
+    display: flex; align-items: center;
+    background: rgba(230, 230, 230, 0.4); 
     backdrop-filter: blur(10px);
-    white-space: nowrap;
+    border-radius: 99px; padding: 3px;
+    border: 1px solid rgba(255,255,255,0.4);
+    box-shadow: 0 4px 10px rgba(0,0,0,0.05);
   }
-  .pill-btn.active {
-    background: var(--text-main); color: var(--bg-body);
-    border-color: var(--text-main);
-    box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-    transform: scale(1.05);
+  .seg-btn {
+    border-radius: 99px; padding: 6px 14px; /* 稍微缩小一点 */
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    color: #444; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); 
+    font-size: 13px; cursor: pointer;
+    overflow: hidden; white-space: nowrap; font-weight: 600;
   }
-
-  /* 媒体卡片 */
-  .media-card {
-    @apply glass-3d; 
-    display: flex; gap: 16px; padding: 14px;
-    margin-bottom: 12px; margin-left: 14px; margin-right: 14px;
-    border-radius: 24px; cursor: pointer; touch-action: manipulation;
-    transition: transform 0.2s, background 0.2s;
+  .seg-btn.active {
+    background: #C084FC; color: #fff;
+    box-shadow: 0 2px 8px rgba(192, 132, 252, 0.4);
   }
-  .media-card:active { transform: scale(0.96); background: rgba(100,100,100,0.1); }
   
-  .poster-thumb {
-    width: 70px; height: 105px; border-radius: 14px;
-    object-fit: cover; background: #222; flex-shrink: 0;
-    box-shadow: 0 4px 10px rgba(0,0,0,0.3);
-  }
-
-  .title-text {
-      color: var(--text-main); font-weight: 700; font-size: 16px;
-      line-height: 1.3; margin-bottom: 2px;
-      display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden;
-  }
-  .meta-text {
-      font-size: 11px; font-weight: 600; color: var(--text-main); opacity: 0.6;
-      margin-bottom: 6px; letter-spacing: 0.3px;
-  }
-  .overview-text {
-      font-size: 12px; line-height: 1.45; color: var(--text-sub); font-weight: 500;
-      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
-  }
-
-  /* 底部胶囊导航 */
-  .capsule-nav {
-    position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
-    width: 200px; height: 60px;
-    background: var(--nav-bg);
-    backdrop-filter: blur(30px) saturate(180%); -webkit-backdrop-filter: blur(30px) saturate(180%);
-    border: 1px solid var(--glass-border); border-radius: 99px;
-    display: flex; justify-content: space-evenly; align-items: center;
-    z-index: 50; box-shadow: 0 20px 40px -10px rgba(0,0,0,0.4);
-  }
-  .nav-item {
-    display: flex; flex-direction: column; align-items: center; gap: 3px;
-    color: var(--text-sub); font-size: 10px; font-weight: 600; width: 60px;
-    transition: all 0.3s;
-  }
-  .nav-item.active { color: var(--text-main); }
-  .nav-icon { font-size: 20px; transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); }
-  .nav-item.active .nav-icon { transform: translateY(-2px) scale(1.1); }
-
-  .status-pill {
-    background: rgba(125,125,125,0.1); border: 1px solid rgba(125,125,125,0.2); 
-    border-radius: 12px; padding: 4px 10px; font-size: 10px; font-weight: 700; color: var(--text-main); opacity: 0.8;
-  }
-  .blue-meta { color: var(--accent-blue); font-family: "SF Pro Rounded", sans-serif; font-size: 13px; font-weight: 800; }
+  .page-header { flex-shrink: 0; padding: 0 20px 8px 20px; z-index: 10; }
+  .page-title { font-size: 26px; font-weight: 900; color: #1F2937; margin-bottom: 8px; letter-spacing: -0.5px; }
   
-  /* 无限循环滚轮 */
-  .hero-roller {
-    position: relative; 
-    width: 100%; height: 220px; 
-    overflow-y: auto; scroll-snap-type: y mandatory; 
-    border-radius: 32px; 
-    box-shadow: 0 15px 35px -5px rgba(0,0,0,0.4);
+  .sub-tabs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+  .sub-tabs::-webkit-scrollbar { display: none; }
+  .sub-pill {
+    padding: 7px 14px; border-radius: 12px; font-size: 12px; font-weight: 700;
+    background: rgba(255,255,255,0.35); border: 1px solid rgba(255,255,255,0.3);
+    color: #4B5563; white-space: nowrap; transition: all 0.2s; flex-shrink: 0;
+  }
+  .sub-pill.active {
+    background: #fff; color: #000; border-color: #fff; transform: scale(1.03);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+  }
+
+  .week-grid-tabs {
+      display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; padding-bottom: 4px;
+  }
+  .week-pill {
+      padding: 7px 0; font-size: 12px; width: 100%; min-width: 0; text-align: center;
+      background: rgba(255,255,255,0.35); border-radius: 10px; font-weight: 700; color: #555;
+      transition: all 0.2s;
+  }
+  .week-pill.active { background: #7C3AED; color: #fff; box-shadow: 0 3px 8px rgba(124, 58, 237, 0.3); }
+
+  /* 🔴 滚动区域优化 */
+  .scroll-content {
+    flex: 1; 
+    overflow-y: auto; 
+    padding: 6px 16px; /* 两侧间距微调 */
+    /* 底部 padding = Dock高度(56) + 悬浮(8) + 安全区 + 留白(10) */
+    padding-bottom: calc(75px + env(safe-area-inset-bottom));
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+  }
+  .scroll-content::-webkit-scrollbar { display: none; }
+  .list-container { display: flex; flex-direction: column; gap: 14px; }
+
+  /* ================= 卡片设计 ================= */
+  .rich-card {
+    position: relative; width: 100%; height: 135px; /* 卡片高度微调 */
+    border-radius: 22px; overflow: hidden; background: #fff;
+    box-shadow: 0 6px 16px -4px rgba(0, 0, 0, 0.1);
+    display: flex; align-items: center; flex-shrink: 0;
+    transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1); cursor: pointer;
+    border: 1px solid rgba(255,255,255,0.6);
+  }
+  .rich-card:active { transform: scale(0.97); }
+
+  .card-bg { position: absolute; inset: 0; background-size: cover; background-position: center; opacity: 0.85; z-index: 0; filter: saturate(1.1); }
+  .card-mask { position: absolute; inset: 0; background: linear-gradient(90deg, #EAECEF 28%, rgba(234,236,239,0.92) 55%, rgba(255,255,255,0.2) 100%); z-index: 1; }
+  .card-body { position: relative; z-index: 2; width: 100%; height: 100%; display: flex; align-items: center; padding-left: 14px; }
+
+  .poster-thumb { width: 76px; height: 112px; border-radius: 12px; object-fit: cover; box-shadow: 0 5px 10px rgba(0,0,0,0.2); flex-shrink: 0; margin-right: 12px; background: #ccc; }
+  .info-col { flex: 1; height: 112px; display: flex; flex-direction: column; padding-top: 4px; position: relative; min-width: 0; }
+
+  .title-txt { font-size: 16px; font-weight: 900; color: #111; margin-bottom: 2px; line-height: 1.2; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; letter-spacing: -0.3px; }
+  .subtitle-txt { font-size: 12px; color: #555; font-weight: 600; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 4px; }
+  
+  .status-txt { font-size: 11px; color: #666; font-weight: 600; margin-bottom: auto; display: flex; align-items: center; gap: 4px; }
+
+  /* 胶囊进度条 */
+  .capsule-bar { 
+      margin-bottom: 5px; width: 88%; height: 24px; 
+      background: rgba(0, 0, 0, 0.12);
+      border-radius: 99px; 
+      display: flex; align-items: center;
+      position: relative; backdrop-filter: blur(10px);
+      padding: 2px; border: 1px solid rgba(255,255,255,0.1);
+  }
+  .capsule-left { 
+      background: #000; color: #fff; 
+      padding: 0 10px; height: 100%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 10px; font-weight: 800; 
+      border-radius: 99px; 
+      white-space: nowrap; z-index: 2;
+      box-shadow: 2px 0 6px rgba(0,0,0,0.15);
+  }
+  .capsule-right { 
+      flex: 1; text-align: right; padding-right: 10px; 
+      color: #000; font-size: 10px; font-weight: 700; 
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; 
+      opacity: 0.8;
+  }
+
+  .check-mark { 
+      position: absolute; bottom: 7px; right: 10px; 
+      color: var(--accent-purple); font-size: 15px; 
+      filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1)); z-index: 5;
+  }
+
+  /* ================= 🔴 iOS 26 Dock (紧凑版) ================= */
+  .bottom-nav {
+    position: absolute; 
+    left: 50%; transform: translateX(-50%);
+    /* 宽度稍微变宽，利用屏幕空间 */
+    width: 92%; max-width: 380px; 
+    /* 高度缩小至 56px (标准iOS TabBar高度) */
+    height: 56px;
+    background: var(--glass-nav);
+    backdrop-filter: blur(25px) saturate(180%);
+    -webkit-backdrop-filter: blur(25px) saturate(180%);
+    border-radius: 99px; 
     border: 1px solid var(--glass-border);
-    scroll-behavior: smooth;
-    -ms-overflow-style: none; scrollbar-width: none;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.12);
+    display: flex; justify-content: space-evenly; align-items: center;
+    z-index: 50; 
+    /* 🔴 核心修改：紧贴 Home Indicator，仅留 8px 间距 */
+    bottom: calc(8px + env(safe-area-inset-bottom));
   }
-  .hero-roller::-webkit-scrollbar { display: none; }
+  
+  .nav-btn { 
+      display: flex; flex-direction: column; align-items: center; justify-content: center; 
+      color: #999; font-size: 9px; gap: 2px; /* 字体缩小，间距缩小 */
+      width: 60px; height: 100%; 
+      transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); 
+  }
+  .nav-btn i { font-size: 20px; transition: transform 0.3s; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.05)); } /* 图标缩小 */
+  .nav-btn.active { color: #000; }
+  .nav-btn.active i { transform: translateY(-2px) scale(1.1); color: #7C3AED; filter: drop-shadow(0 3px 6px rgba(124, 58, 237, 0.25)); }
+  
+  .user-avatar { width: 24px; height: 24px; border-radius: 50%; background: #ccc; border: 2px solid transparent; transition: all 0.3s; box-shadow: 0 2px 5px rgba(0,0,0,0.15); }
+  .nav-btn.active .user-avatar { border-color: #7C3AED; transform: translateY(-2px) scale(1.05); }
 
-  .hero-slide {
-    width: 100%; height: 100%; 
-    scroll-snap-align: start; position: relative;
-  }
-  .hero-slide img { width: 100%; height: 100%; object-fit: cover; }
+  /* Modal */
+  .modal-overlay { position: absolute; inset: 0; z-index: 100; background: rgba(0,0,0,0.3); backdrop-filter: blur(6px); display: flex; align-items: flex-end; transition: opacity 0.3s; }
+  @media (max-width: 1024px) { .modal-overlay { position: fixed; bottom: 0; left: 0; right: 0; top: 0; } }
   
-  .scroll-indicators {
-    position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
-    display: flex; flex-direction: column; gap: 6px; z-index: 20;
-    pointer-events: none;
-  }
-  .indicator-dot { width: 4px; height: 4px; background: rgba(255,255,255,0.3); border-radius: 99px; }
+  .detail-sheet { width: 100%; max-height: 85%; background: #fff; border-radius: 32px 32px 0 0; padding-bottom: calc(30px + env(safe-area-inset-bottom)); box-shadow: 0 -10px 50px rgba(0,0,0,0.2); display: flex; flex-direction: column; overflow: hidden; animation: slideUp 0.4s cubic-bezier(0.19, 1, 0.22, 1); }
+  @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  .sheet-header { height: 220px; position: relative; flex-shrink: 0; }
+  .sheet-backdrop { width: 100%; height: 100%; object-fit: cover; }
+  .sheet-close { position: absolute; top: 16px; right: 16px; width: 32px; height: 32px; border-radius: 50%; background: rgba(0,0,0,0.4); color: #fff; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(15px); cursor: pointer; border: 1px solid rgba(255,255,255,0.2); }
+  .sheet-body { padding: 20px; overflow-y: auto; }
+  .sheet-title { font-size: 24px; font-weight: 900; line-height: 1.1; margin-bottom: 8px; color: #111; letter-spacing: -0.5px; }
+  .sheet-meta { display: flex; gap: 8px; font-size: 12px; color: #666; margin-bottom: 16px; font-weight: 700; flex-wrap: wrap; }
+  .meta-tag { background: #F3F4F6; padding: 6px 10px; border-radius: 8px; }
+  .sheet-overview { font-size: 15px; line-height: 1.6; color: #444; margin-bottom: 24px; font-weight: 400; }
+  .sheet-btn { width: 100%; padding: 14px; border-radius: 18px; background: #111; color: #fff; font-weight: 800; font-size: 16px; display: flex; justify-content: center; align-items: center; gap: 10px; box-shadow: 0 10px 20px rgba(0,0,0,0.2); transition: transform 0.2s; }
+  .sheet-btn:active { transform: scale(0.98); }
 
-  /* 星期滑动容器 */
-  .swipe-area {
-    min-height: 300px;
-    touch-action: pan-y;
-  }
-  
-  .fade-slide-enter-active, .fade-slide-leave-active { transition: all 0.25s ease; }
-  .fade-slide-enter-from { opacity: 0; transform: translateX(10px); }
-  .fade-slide-leave-to { opacity: 0; transform: translateX(-10px); }
-  
-  .trakt-tag { 
-      font-size: 9px; padding: 2px 4px; border-radius: 4px; margin-left: 6px; vertical-align: middle;
-  }
+  .loading-box { display: flex; justify-content: center; padding-top: 150px; color: #888; }
 </style>
 </head>
 <body>
 
 <div id="app-container">
-    <!-- Header -->
-    <header class="sticky top-0 z-40 px-6 py-4 flex items-center justify-between transition-colors z-50">
-        <div class="absolute inset-0 bg-[var(--bg-body)]/0 backdrop-blur-[2px]"></div>
+    
+    <div class="header-nav">
+        <div class="media-segment">
+            <div @click="filterType = 'all'" :class="['seg-btn', filterType === 'all' ? 'active' : '']">
+                <i class="fas fa-layer-group"></i><span v-if="filterType === 'all'">媒体库</span>
+            </div>
+            <div @click="filterType = 'tv'" :class="['seg-btn', filterType === 'tv' ? 'active' : '']">
+                <i class="fas fa-tv"></i><span v-if="filterType === 'tv'">电视剧</span>
+            </div>
+            <div @click="filterType = 'movie'" :class="['seg-btn', filterType === 'movie' ? 'active' : '']">
+                <i class="fas fa-film"></i><span v-if="filterType === 'movie'">电影</span>
+            </div>
+        </div>
+        <div style="width:24px;"></div> 
+    </div>
+
+    <div class="page-header">
+        <h2 class="page-title">{{ getPageTitle() }}</h2>
         
-        <a href="javascript:location.reload()" class="relative active:opacity-60 transition-opacity z-10">
-            <img src="https://www.themoviedb.org/assets/2/v4/logos/v2/blue_short-8e7b30f73a4020692ccca9c88bafe5dcb6f8a62a4c6bc55cd9ba82bb2cd95f6c.svg" 
-                 alt="TMDB" class="h-3.5 object-contain filter drop-shadow-lg">
-        </a>
+        <div class="week-grid-tabs" v-if="currentMainTab === 'schedule'">
+             <button v-for="(d, idx) in weekDays" :key="idx" 
+                @click="selectedWeekDay = idx"
+                :class="['week-pill', selectedWeekDay === idx ? 'active' : '']">
+                {{ d }}
+             </button>
+        </div>
         
-        <div class="flex gap-3 relative z-10">
-            <button @click="toggleTheme" class="w-9 h-9 rounded-full glass-3d flex items-center justify-center active:scale-90 transition-transform">
-                <i :class="isLight ? 'fas fa-sun text-orange-400' : 'fas fa-moon text-blue-300'"></i>
-            </button>
-            <button class="w-9 h-9 rounded-full glass-3d flex items-center justify-center active:scale-90 transition-transform">
-                <i class="fas fa-user-circle" style="color: var(--text-sub)"></i>
-            </button>
+        <div class="sub-tabs" v-else>
+            <button v-for="tab in subTabs" :key="tab.key" @click="currentSubTab = tab.key" 
+                :class="['sub-pill', currentSubTab === tab.key ? 'active' : '']">{{ tab.name }}</button>
         </div>
-    </header>
+    </div>
 
-    <main>
-        <!-- Banner -->
-        <div v-if="filteredList.length > 0 && currentSubTab !== 'fav_all' && currentSubTab !== 'watchlist'" class="px-4 mt-1 relative">
-            <div class="hero-roller">
-                <div v-for="(item, index) in infiniteBannerList" :key="index" class="hero-slide" @click="openDetail(item)">
-                    <img :src="getBackdrop(item.backdrop_path)" loading="lazy">
-                    <div class="absolute inset-0 bg-gradient-to-t from-black/90 via-black/20 to-transparent flex flex-col justify-end p-6">
-                        <div class="flex items-center gap-2 mb-2">
-                             <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
-                             <span class="text-[11px] text-blue-300 font-bold uppercase tracking-wider">
-                                 {{ getStatusLabel() }}
-                             </span>
-                        </div>
-                        <h2 class="text-white font-bold text-xl line-clamp-1 drop-shadow-md">{{ item.name || item.title }}</h2>
-                        <p class="text-white/80 text-xs mt-1.5 line-clamp-1 font-medium">{{ item.overview || '暂无简介' }}</p>
-                    </div>
-                </div>
-            </div>
-            <!-- 只有多于1页时才显示指示器 -->
-            <div v-if="infiniteBannerList.length > 1" class="scroll-indicators">
-                <div class="indicator-dot bg-white/90"></div>
-                <div class="indicator-dot"></div>
-                <div class="indicator-dot"></div>
-            </div>
-        </div>
-
-        <!-- Filters -->
-        <div class="px-5 flex gap-3 overflow-x-auto hide-scroll mb-6 pb-2 pt-2">
-            <button v-for="tab in subTabs" :key="tab.key" 
-                @click="currentSubTab = tab.key"
-                :class="['pill-btn', currentSubTab === tab.key ? 'active' : '']">
-                {{ tab.name }}
-            </button>
-        </div>
-
-        <!-- Loading -->
-        <div v-if="loading" class="py-24 flex justify-center">
-            <div class="w-8 h-8 border-4 border-[var(--text-sub)] border-t-transparent rounded-full animate-spin opacity-50"></div>
-        </div>
-
-        <!-- List Content Area -->
-        <div v-else class="flex flex-col swipe-area" 
-             @touchstart="touchStart" 
-             @touchend="touchEnd">
-             
-            <!-- Week Selector -->
-            <div v-if="isScheduleTab" 
-                 class="flex justify-between mb-5 px-8 select-none transition-all duration-300">
-                 <button v-for="(day, idx) in weekDays" :key="idx" @click="selectedDay = idx"
-                    class="text-xs font-semibold flex flex-col items-center gap-1.5 transition-all"
-                    :style="{ color: selectedDay === idx ? 'var(--accent-blue)' : 'var(--text-sub)', opacity: selectedDay === idx ? 1 : 0.6, transform: selectedDay === idx ? 'scale(1.1)' : 'scale(1)' }">
-                    <span>{{ day }}</span>
-                    <span class="w-1.5 h-1.5 rounded-full transition-all" 
-                          :style="{ background: selectedDay === idx ? 'var(--accent-blue)' : 'transparent'}"></span>
-                 </button>
-            </div>
-
-            <!-- Cards -->
-            <transition-group name="fade-slide" tag="div">
-                <div v-for="item in filteredList" :key="item.id" @click="openDetail(item)" class="media-card group">
-                    <img :src="getPoster(item.poster_path)" class="poster-thumb">
-                    
-                    <div class="flex-1 min-w-0 flex flex-col justify-center">
-                        <h3 class="title-text">{{ item.name || item.title }}</h3>
-                        <div class="meta-text">
-                            {{ (item.first_air_date||item.release_date||'').slice(0,4) }} &middot; {{ item.media_type==='movie'?'剧场版':'TV' }}
-                            <span v-if="item.trakt_type === 'history'" class="trakt-tag bg-green-500/20 text-green-500">正在看</span>
-                            <span v-if="item.trakt_type === 'watchlist'" class="trakt-tag bg-orange-500/20 text-orange-500">待看</span>
-                            <span v-if="item.trakt_type === 'trending'" class="trakt-tag bg-red-500/20 text-red-500">Hot</span>
-                        </div>
-                        <p class="overview-text">{{ item.overview || '暂无简介' }}</p>
-                    </div>
-                    
-                    <div class="flex flex-col justify-center items-end gap-2 shrink-0 pl-1">
-                        <!-- 🔥 追番周历 & 新番时刻：显示集数 + 时间 -->
-                        <div v-if="isScheduleTab && item.air_time_iso" class="flex flex-col items-end">
-                             <!-- 集数在时间上方 -->
-                             <div class="blue-meta mb-0.5">{{ getFakeEpisode(item) }}</div>
-                             <!-- 时间字体更小更淡 -->
-                             <div class="text-[10px] font-bold opacity-80" style="color: var(--text-sub); font-family: 'SF Pro Rounded', sans-serif">
-                                 {{ formatTime(item.air_time_iso) }}
-                             </div>
-                        </div>
+    <div class="scroll-content">
+        <div v-if="loading" class="loading-box"><i class="fas fa-circle-notch fa-spin fa-2x"></i></div>
+        <div v-else class="list-container">
+            <div v-for="item in processedList" :key="item.id" class="rich-card" @click="openModal(item)">
+                <div class="card-bg" :style="{ backgroundImage: 'url(' + getBackdrop(item) + ')' }"></div>
+                <div class="card-mask"></div>
+                <div class="card-body">
+                    <img :src="getPoster(item)" class="poster-thumb" loading="lazy">
+                    <div class="info-col">
+                        <div style="position:absolute; top:0; right:10px; color:#fff; text-shadow:0 1px 3px rgba(0,0,0,0.6);"><i class="fas fa-ellipsis-h"></i></div>
                         
-                        <!-- 普通模式 -->
-                        <div v-else class="blue-meta">{{ getFakeEpisode(item) }}</div>
+                        <div class="title-txt">{{ item.name || item.title }}</div>
+                        <div class="subtitle-txt">{{ formatSubtitle(item) }}</div>
                         
-                        <div class="status-pill whitespace-nowrap">{{ getStatusText(item) }}</div>
+                        <div class="status-txt">
+                            <i class="far fa-calendar-check"></i>
+                            {{ formatScheduleInfo(item) }}
+                        </div>
+
+                        <!-- 胶囊条 -->
+                        <div class="capsule-bar">
+                            <div class="capsule-left">{{ formatDuration(item) }}</div>
+                            <div class="capsule-right">{{ formatCapsuleRight(item) }}</div>
+                        </div>
+
+                        <!-- 勾选图标 -->
+                        <div class="check-mark"><i class="fas fa-check-circle"></i></div>
                     </div>
                 </div>
-            </transition-group>
-
-            <div v-if="filteredList.length === 0" class="py-24 text-center text-sm font-medium select-none" style="color: var(--text-sub)">
-                <i class="far fa-folder-open mb-3 text-2xl opacity-50"></i><br>
-                <span v-if="isScheduleTab">今天没有更新哦</span>
-                <span v-else>暂无内容</span>
             </div>
+            <div v-if="processedList.length === 0" class="text-center py-20 text-gray-400 text-sm font-bold">暂时没有内容</div>
         </div>
-    </main>
+    </div>
 
-    <!-- Capsule Nav -->
-    <nav class="capsule-nav">
-        <button @click="switchMainTab('discover')" :class="['nav-item', currentMainTab === 'discover' ? 'active' : '']">
-            <i class="fas fa-compass nav-icon"></i>
-            <span>发现</span>
-        </button>
-        <button @click="switchMainTab('mine')" :class="['nav-item', currentMainTab === 'mine' ? 'active' : '']">
-            <i class="fas fa-user nav-icon"></i>
-            <span>我的</span>
-        </button>
-    </nav>
+    <div class="bottom-nav">
+        <div @click="switchMainTab('discover')" :class="['nav-btn', currentMainTab === 'discover' ? 'active' : '']">
+            <i class="far fa-compass"></i><span>发现</span>
+        </div>
+        <div @click="switchMainTab('schedule')" :class="['nav-btn', currentMainTab === 'schedule' ? 'active' : '']">
+            <i class="far fa-calendar-alt"></i><span>新番</span>
+        </div>
+        <div @click="switchMainTab('mine')" :class="['nav-btn', currentMainTab === 'mine' ? 'active' : '']">
+            <img src="https://ui-avatars.com/api/?name=Me&background=random&color=fff" class="user-avatar"><span>我的</span>
+        </div>
+    </div>
 
-    <!-- Modal -->
-    <div v-if="selected" class="fixed inset-0 z-50 flex items-center justify-center p-5">
-        <div class="fixed inset-0 bg-black/60 backdrop-blur-md transition-opacity" @click="selected = null"></div>
-        <div class="relative w-full max-w-[380px] bg-[var(--bg-body)] rounded-[32px] overflow-hidden h-[72vh] flex flex-col animate-pop shadow-2xl border border-[var(--glass-border)]">
-            <div class="h-64 relative shrink-0">
-                <img :src="getBackdrop(selected.backdrop_path)" class="w-full h-full object-cover">
-                <div class="absolute inset-0 bg-gradient-to-t from-[var(--bg-body)] to-transparent"></div>
-                <button @click="selected = null" class="absolute top-5 right-5 w-9 h-9 rounded-full glass-3d flex items-center justify-center text-white active:scale-90 transition-transform z-20">
-                    <i class="fas fa-times text-sm"></i>
-                </button>
+    <div v-if="selectedItem" class="modal-overlay" @click.self="selectedItem = null">
+        <div class="detail-sheet">
+            <div class="sheet-header">
+                <img :src="getBackdrop(selectedItem)" class="sheet-backdrop">
+                <div class="sheet-close" @click="selectedItem = null"><i class="fas fa-times"></i></div>
             </div>
-            <div class="px-7 py-2 overflow-y-auto flex-1 -mt-6 relative z-10">
-                <h2 class="text-2xl font-bold mb-3 leading-tight" style="color: var(--text-main)">{{ selected.name || selected.title }}</h2>
-                <div class="flex flex-wrap gap-2 mb-6">
-                     <span class="text-[10px] font-bold px-2.5 py-1 rounded-lg border border-[var(--glass-border)] bg-[var(--pill-bg)]" style="color: var(--text-main)">{{ selected.first_air_date || selected.release_date }}</span>
-                     <span class="text-[10px] font-bold px-2.5 py-1 rounded-lg bg-yellow-500/10 text-yellow-600 border border-yellow-500/20">★ {{ selected.vote_average?.toFixed(1) }}</span>
-                     
-                     <span v-if="selected.air_time_iso" class="text-[10px] font-bold px-2.5 py-1 rounded-lg bg-green-500/10 text-green-500 border border-green-500/20">
-                         {{ formatTime(selected.air_time_iso) }} 更新
-                     </span>
-                     
-                     <span v-if="selected.episode_info" class="text-[10px] font-bold px-2.5 py-1 rounded-lg bg-blue-500/10 text-blue-500 border border-blue-500/20">
-                        S{{selected.episode_info.season}}E{{selected.episode_info.number}}
-                     </span>
+            <div class="sheet-body">
+                <h2 class="sheet-title">{{ selectedItem.name || selectedItem.title }}</h2>
+                <div class="sheet-meta">
+                    <span class="meta-tag">{{ formatSubtitle(selectedItem) }}</span>
+                    <span class="meta-tag" v-if="selectedItem.runtime_real">{{ selectedItem.runtime_real }}分钟</span>
+                    <span class="meta-tag">TMDB {{ selectedItem.vote_average?.toFixed(1) }}</span>
                 </div>
-                <p class="text-sm leading-relaxed font-medium opacity-90" style="color: var(--text-sub)">{{ selected.overview || '暂无简介' }}</p>
-                <div class="mt-10 mb-6">
-                    <button class="w-full py-4 rounded-2xl font-bold text-white bg-[var(--accent-blue)] active:scale-95 transition-transform shadow-lg shadow-blue-500/30 flex items-center justify-center gap-2">
-                        <i class="fas fa-play"></i> 开始播放
-                    </button>
-                </div>
+                <p class="sheet-overview">{{ selectedItem.overview || '暂无简介...' }}</p>
+                <div class="sheet-btn"><i class="fas fa-play"></i> 立即播放</div>
             </div>
         </div>
     </div>
+
 </div>
 
 <script>
@@ -603,67 +536,51 @@ const { createApp, ref, computed, onMounted, watch } = Vue;
 createApp({
     setup() {
         const TMDB_IMG = 'https://image.tmdb.org/t/p/';
-        const isLight = ref(false);
         const currentMainTab = ref('mine'); 
-        const currentSubTab = ref('fav_week'); 
-        const selectedDay = ref(new Date().getDay());
-        const weekDays = ['周日','周一','周二','周三','周四','周五','周六'];
-        
+        const currentSubTab = ref('watching');
+        const filterType = ref('all'); 
         const loading = ref(false);
         const rawData = ref([]);
-        const selected = ref(null);
+        const selectedItem = ref(null);
         
-        const touchStartX = ref(0); const touchEndX = ref(0);
-
-        const toggleTheme = () => {
-            isLight.value = !isLight.value;
-            const container = document.getElementById('app-container');
-            if(isLight.value) container.classList.add('light-mode');
-            else container.classList.remove('light-mode');
-        };
+        const weekDays = ['周日','周一','周二','周三','周四','周五','周六'];
+        const selectedWeekDay = ref(new Date().getDay()); 
 
         const subTabs = computed(() => {
             if (currentMainTab.value === 'mine') {
-                return [ 
-                    { key: 'fav_week', name: '追番周历' },
-                    { key: 'watching', name: '正在观看' },
-                    { key: 'watchlist', name: '稍后观看' },
-                    { key: 'fav_all', name: '全部收藏' } 
-                ];
+                return [ { key: 'watching', name: '继续观看' }, { key: 'fav_week', name: '待看列表' }, { key: 'watchlist', name: '稍后观看' }, { key: 'fav_all', name: '全部收藏' } ];
+            } else if (currentMainTab.value === 'schedule') {
+                return []; 
             } else {
-                return [ 
-                    { key: 'schedule', name: '新番时刻' }, 
-                    { key: 'trakt_hot', name: 'Trakt热门' },
-                    { key: 'hot', name: '热映中' }, 
-                    { key: 'top', name: '高分榜' } 
-                ];
+                return [ { key: 'trakt_hot', name: '热门趋势' }, { key: 'hot', name: '本周热榜' } ];
             }
         });
 
-        const isScheduleTab = computed(() => ['schedule', 'fav_week'].includes(currentSubTab.value));
+        const getPageTitle = () => {
+            if(currentMainTab.value === 'schedule') return '新番时刻表';
+            const map = { 'watching': '继续观看', 'fav_week': '待看列表', 'watchlist': '稍后观看', 'fav_all': '我的收藏', 'trakt_hot': 'Trakt 热门', 'hot': 'TMDB 热榜' };
+            return map[currentSubTab.value] || '发现';
+        };
 
-        const getFakeEpisode = (item) => {
-            if(item.episode_info) return \`S\${item.episode_info.season} E\${item.episode_info.number}\`;
-            if(item.media_type === 'movie') return '剧场版';
-            const ep = (item.id % 12) + 1;
-            return \`第 \${ep} 集\`;
-        };
-        const getStatusText = (item) => {
-             if(item.air_time_iso) return '更新中';
-             if(item.media_type === 'movie') return '全1集';
-             return '连载中';
-        };
-        const getStatusLabel = () => {
-            if(currentSubTab.value === 'hot') return '热映推荐';
-            if(currentSubTab.value === 'trakt_hot') return 'Trakt 趋势';
-            return '今日更新';
-        };
+        const processedList = computed(() => {
+            let list = rawData.value;
+            if (filterType.value === 'tv') list = list.filter(i => i.media_type === 'tv');
+            if (filterType.value === 'movie') list = list.filter(i => i.media_type === 'movie');
+            
+            if (currentMainTab.value === 'schedule') {
+                return list.filter(i => {
+                    const dateStr = i.air_time_iso || i.first_air_date;
+                    if(!dateStr) return false;
+                    return new Date(dateStr).getDay() === selectedWeekDay.value;
+                });
+            }
+            return list;
+        });
 
         const fetchData = async () => {
             loading.value = true;
             rawData.value = [];
             let url = '';
-            
             if(currentSubTab.value === 'fav_week') url = '/api/user/calendar'; 
             else if(currentSubTab.value === 'watching') url = '/api/user/history';
             else if(currentSubTab.value === 'watchlist') url = '/api/user/watchlist';
@@ -680,90 +597,91 @@ createApp({
 
         const switchMainTab = (tab) => {
             currentMainTab.value = tab;
-            currentSubTab.value = tab === 'mine' ? 'fav_week' : 'schedule';
+            if(tab === 'mine') currentSubTab.value = 'watching';
+            else if(tab === 'schedule') currentSubTab.value = 'schedule';
+            else currentSubTab.value = 'trakt_hot';
             fetchData();
         };
 
-        watch(currentSubTab, () => fetchData());
-
-        const filteredList = computed(() => {
-            let list = rawData.value;
-            if (isScheduleTab.value) {
-                return list.filter(i => {
-                    let dateStr = i.first_air_date || i.release_date;
-                    if (i.air_time_iso) dateStr = i.air_time_iso;
-                    if(!dateStr) return false;
-                    return new Date(dateStr).getDay() === selectedDay.value;
-                }).sort((a,b) => {
-                    if (a.air_time_iso && b.air_time_iso) {
-                         return new Date(a.air_time_iso) - new Date(b.air_time_iso);
-                    }
-                    return 0;
-                });
-            }
-            return list;
+        watch([currentSubTab, selectedWeekDay], () => {
+             if(currentMainTab.value !== 'schedule') fetchData();
         });
-
-        const infiniteBannerList = computed(() => {
-            const source = filteredList.value.slice(0, 5); 
-            if (source.length === 0) return [];
-            if (source.length === 1) return source; 
-            let res = [];
-            for(let i=0; i<20; i++) res = res.concat(source);
-            return res;
-        });
-
-        const touchStart = (e) => touchStartX.value = e.changedTouches[0].screenX;
-        const touchEnd = (e) => {
-            touchEndX.value = e.changedTouches[0].screenX;
-            handleSwipe();
-        };
-
-        const handleSwipe = () => {
-            if (!isScheduleTab.value) return;
-            const diffX = touchEndX.value - touchStartX.value;
-            if (Math.abs(diffX) > 100) {
-                if (diffX > 0) selectedDay.value = (selectedDay.value - 1 + 7) % 7;
-                else selectedDay.value = (selectedDay.value + 1) % 7;
-            }
-        };
-
-        const getPoster = (path) => path ? TMDB_IMG + 'w200' + path : 'https://via.placeholder.com/200x300/333/666';
-        const getBackdrop = (path) => path ? TMDB_IMG + 'w780' + path : 'https://via.placeholder.com/780x400/333/666';
-        const openDetail = (item) => selected.value = item;
         
-        const formatTime = (isoStr) => {
-            if(!isoStr) return '';
-            const date = new Date(isoStr);
-            const h = date.getHours().toString().padStart(2, '0');
-            const m = date.getMinutes().toString().padStart(2, '0');
-            return \`\${h}:\${m}\`;
+        watch(currentMainTab, () => { fetchData(); })
+
+        const formatSubtitle = (item) => {
+            if (item.episode_info) {
+                return \`S\${item.episode_info.season} • E\${item.episode_info.number}\`;
+            }
+            if (item.total_episodes) return \`共 \${item.total_episodes} 集\`;
+            return item.original_name || item.title || 'Movie';
         };
+
+        const formatDuration = (item) => {
+            let t = item.runtime_real || (item.episode_run_time ? item.episode_run_time[0] : 0) || 24;
+            return \`\${t}分钟\`;
+        };
+
+        const formatScheduleInfo = (item) => {
+            if (item.status === 'Returning Series' && item.next_ep_date) {
+                const day = new Date(item.next_ep_date).getDay();
+                const weekStr = ['日','一','二','三','四','五','六'][day];
+                return \`每周\${weekStr}更新\`;
+            }
+            if (item.status === 'Ended' && item.first_air_date && item.last_ep_date) {
+                const start = item.first_air_date.slice(0,4);
+                const end = item.last_ep_date.slice(0,4);
+                return \`\${start} - \${end}\`;
+            }
+            if(item.release_date) return item.release_date; 
+            if(item.first_air_date) return \`首播: \${item.first_air_date}\`;
+            return '未知日程';
+        };
+
+        const formatCapsuleRight = (item) => {
+            if (item.air_time_iso) {
+                const date = new Date(item.air_time_iso);
+                const h = date.getHours().toString().padStart(2, '0');
+                const m = date.getMinutes().toString().padStart(2, '0');
+                return \`\${h}:\${m} 播放\`;
+            }
+            if (item.next_ep_date) {
+                const d = new Date(item.next_ep_date);
+                const m = (d.getMonth()+1).toString().padStart(2, '0');
+                const day = d.getDate().toString().padStart(2, '0');
+                return \`\${m}/\${day} 更新\`;
+            }
+            if (item.status === 'Returning Series' && item.last_ep_date) {
+                 const d = new Date(item.last_ep_date);
+                 const m = (d.getMonth()+1).toString().padStart(2, '0');
+                 const day = d.getDate().toString().padStart(2, '0');
+                 return \`\${m}/\${day} 更新\`;
+            }
+            if(item.status === 'Ended') return '已完结';
+            if(item.release_date) return item.release_date.slice(0,4);
+            return '待定';
+        };
+
+        const getPoster = (i) => i.poster_path ? TMDB_IMG + 'w200' + i.poster_path : 'https://via.placeholder.com/200x300/e0e0e0/ffffff?text=No+Poster';
+        const getBackdrop = (i) => {
+            if (i.episode_image) return TMDB_IMG + 'w780' + i.episode_image;
+            if (i.backdrop_path) return TMDB_IMG + 'w780' + i.backdrop_path;
+            return 'https://via.placeholder.com/600x340/e0e0e0/ffffff?text=Reflix';
+        };
+        
+        const openModal = (item) => { selectedItem.value = item; };
 
         onMounted(() => fetchData());
 
         return {
-            isLight, toggleTheme, currentMainTab, switchMainTab, currentSubTab, subTabs,
-            selectedDay, weekDays, loading, filteredList, infiniteBannerList, selected, 
-            getPoster, getBackdrop, openDetail, getFakeEpisode, getStatusText, getStatusLabel,
-            touchStart, touchEnd, isScheduleTab, formatTime
+            currentMainTab, switchMainTab, currentSubTab, subTabs, filterType,
+            weekDays, selectedWeekDay,
+            loading, processedList, getPageTitle, selectedItem, openModal,
+            getPoster, getBackdrop, formatSubtitle, formatDuration, formatScheduleInfo, formatCapsuleRight
         };
     }
 }).mount('#app-container');
 </script>
-<style>
-@keyframes pop { from { transform: scale(0.92) translateY(10px); opacity: 0; } to { transform: scale(1) translateY(0); opacity: 1; } }
-.animate-pop { animation: pop 0.4s cubic-bezier(0.19, 1, 0.22, 1); }
-.glass-3d {
-    background: linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
-}
-.light-mode .glass-3d {
-    background: linear-gradient(135deg, rgba(255,255,255,0.8), rgba(255,255,255,0.4));
-}
-.fade-slide-enter-active, .fade-slide-leave-active { transition: all 0.25s ease; }
-.fade-slide-enter-from { opacity: 0; transform: translateX(10px); }
-.fade-slide-leave-to { opacity: 0; transform: translateX(-10px); }
-</style>
 </body>
-</html>   
+</html>
 `;
