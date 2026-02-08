@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (V10: 修复版 - 严保新番时刻表，只改个人主页)
+ * Cloudflare Worker 追番列表 (V11: 追新混合版 - 个人+公共日历合并)
  * ==============================================================================
  */
 
@@ -34,44 +34,24 @@ export default {
             }
 
             try {
-                // ⚡️ POST 交互 (加入/取消追番/标记已看)
+                // ⚡️ POST 交互
                 if (request.method === 'POST' && path === '/api/action') {
                     return await handleUserAction(request, cleanEnv);
                 }
 
-                // ⚡️ GET 获取数据 - [我的] 页面的四个专属接口
-                
-                // 1. 继续观看 (Continue Watching) -> sync/playback
-                if (path.includes('/user/continue')) {
-                    return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, 
-                        () => handleTraktRequest(cleanEnv, 'sync/playback', 20));
-                }
-
-                // 2. 我的追番 (Start Watching) -> sync/watchlist
-                if (path.includes('/user/watchlist')) {
-                    return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, 
-                        () => handleTraktRequest(cleanEnv, 'sync/watchlist'));
-                }
-
-                // 3. 即将播出 (Upcoming Schedule) -> calendars/my/shows
-                if (path.includes('/user/myschedule')) {
-                    return handleSmartCache(env, ctx, 'my_schedule', TTL_SHORT, 
-                        () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14)); // 未来14天
-                }
-
-                // 4. 播放记录 (History) -> sync/history
-                if (path.includes('/user/history')) {
-                    return handleSmartCache(env, ctx, 'history', TTL_SHORT, 
-                        () => handleTraktRequest(cleanEnv, 'sync/history', 20));
-                }
-                
-                // 5. TMDB 收藏 (保留)
+                // ⚡️ GET 获取数据 - [我的] 页面接口
+                if (path.includes('/user/continue')) return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/playback', 20));
+                if (path.includes('/user/watchlist')) return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/watchlist'));
+                if (path.includes('/user/myschedule')) return handleSmartCache(env, ctx, 'my_schedule', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14));
+                if (path.includes('/user/history')) return handleSmartCache(env, ctx, 'history', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/history', 20));
                 if (path.includes('/user/favs')) return handleSmartCache(env, ctx, 'favs', TTL_SHORT, () => handleUserFavs(cleanEnv));
                 
-                // ⚡️ 公共列表 (发现/新番时刻表) - 保持原样，不动这里的逻辑
+                // ⚡️ 列表请求 (这里修改了 schedule 的逻辑)
                 if (path.includes('/list')) {
                     const tab = url.searchParams.get('tab') || 'schedule';
-                    return handleSmartCache(env, ctx, `list_${tab}`, TTL_LONG, () => handleListRequest(cleanEnv, url.searchParams));
+                    // schedule 缓存时间稍微缩短，因为包含了你的个人数据，需要较快更新
+                    const ttl = tab === 'schedule' ? TTL_SHORT : TTL_LONG; 
+                    return handleSmartCache(env, ctx, `list_${tab}`, ttl, () => handleListRequest(cleanEnv, url.searchParams));
                 }
 
                 return new Response(JSON.stringify({ error: "Endpoint Not Found" }), { status: 404 });
@@ -81,13 +61,14 @@ export default {
             }
         }
 
-        // 🛡️ 2. 缓存清理指令
+        // 🛡️ 2. 缓存清理
         if (path === '/flush') {
             await env.KV.delete('TRAKT_AUTH');
             await env.KV.delete('watchlist'); 
             await env.KV.delete('history');   
             await env.KV.delete('my_schedule');
             await env.KV.delete('continue_watching');
+            await env.KV.delete('list_schedule'); // 清理混合日历缓存
             return new Response("Cache Flushed", {status: 200});
         }
 
@@ -117,15 +98,15 @@ async function handleUserAction(request, env) {
 
     if (!endpoint) return new Response(JSON.stringify({error: "Unknown Action"}), {status: 400});
 
-    const res = await fetch(`https://api.trakt.tv/${endpoint}`, {
-        method: 'POST', headers, body: JSON.stringify(payload)
-    });
-
+    const res = await fetch(`https://api.trakt.tv/${endpoint}`, { method: 'POST', headers, body: JSON.stringify(payload) });
     const data = await res.json();
     
     // 操作成功后清理缓存
     if (res.ok) {
         if (action.includes('chase')) await env.KV.delete('watchlist');
+        // 标记已看或修改追番，都会影响日程，所以要清理 list_schedule
+        await env.KV.delete('list_schedule'); 
+        await env.KV.delete('my_schedule');
         if (action.includes('history')) {
             await env.KV.delete('history');
             await env.KV.delete('continue_watching');
@@ -172,7 +153,7 @@ async function handleSmartCache(env, ctx, key, ttl, fetcher) {
     return res;
 }
 
-// --- Trakt 请求处理 (个人数据) ---
+// --- Trakt 请求处理 ---
 async function handleTraktRequest(env, path, limit) {
     const token = await getValidAccessToken(env);
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
@@ -180,7 +161,7 @@ async function handleTraktRequest(env, path, limit) {
     
     if (path.includes('watchlist')) url += `?sort=added,desc`; 
     else if (path.includes('history')) url += `?limit=${limit}`;
-    else if (path.includes('playback')) url += `?limit=${limit}`; // 断点续播
+    else if (path.includes('playback')) url += `?limit=${limit}`; 
     else if (path.includes('calendars')) url = `${url}/${new Date().toISOString().split('T')[0]}/${limit}`;
 
     const res = await fetch(url, { headers });
@@ -189,7 +170,6 @@ async function handleTraktRequest(env, path, limit) {
     try { data = JSON.parse(textData); } catch(e) { throw new Error("Trakt API Error"); }
     if (!res.ok) throw new Error(`API Error: ${res.status}`);
     
-    // 类型标记，用于前端显示
     let typeOverride = 'default';
     if (path.includes('watchlist')) typeOverride = 'chase';
     else if (path.includes('history')) typeOverride = 'history';
@@ -205,18 +185,89 @@ async function handleTraktRequest(env, path, limit) {
     return new Response(JSON.stringify(hydrated), { headers: {'Content-Type': 'application/json'} });
 }
 
+// --- 核心：混合列表逻辑 (合并 个人追番 + 公共新番) ---
+async function handleListRequest(env, params) {
+    const tab = params.get('tab') || 'schedule';
+    
+    // 如果是“追新时刻表”，我们需要 Auth Token 来获取你的个人日历
+    const token = (tab === 'schedule') ? await getValidAccessToken(env) : null;
+    
+    const headers = { 
+        ...REFLIX_HEADERS, 
+        'trakt-api-key': env.TRAKT_ID,
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+    };
+
+    let results = [];
+    if (tab === 'schedule') {
+        const today = new Date().toISOString().split('T')[0];
+        const days = 7;
+        
+        // 1. 获取你的个人日历 (美剧、日剧、动画...) - 这样你看了什么，这里就同步什么
+        const myCalPromise = fetch(`https://api.trakt.tv/calendars/my/shows/${today}/${days}`, { headers });
+        
+        // 2. 获取公共新番日历 (用于发现) - 保持原有逻辑
+        const pubCalPromise = fetch(`https://api.trakt.tv/calendars/all/shows/${today}/${days}?extended=full`, { headers });
+        
+        const [myRes, pubRes] = await Promise.all([myCalPromise, pubCalPromise]);
+        
+        let myData = [];
+        let pubData = [];
+        
+        if (myRes.ok) myData = await myRes.json();
+        if (pubRes.ok) pubData = await pubRes.json();
+
+        // 筛选公共日历里的日本动画
+        const pubAnime = pubData.filter(i => (i.show?.country === 'jp') && (i.show?.genres?.includes('anime') || i.show?.genres?.includes('animation')));
+        
+        // 3. 合并与去重 (优先保留你的个人记录)
+        const seenIds = new Set();
+        const mergedList = [];
+
+        // 先加你的 (包含美剧、韩剧、动画等所有)
+        for (const item of myData) {
+            const id = item.show?.ids?.trakt;
+            if (id && !seenIds.has(id)) {
+                seenIds.add(id);
+                // 标记一下这是你正在追的 (可选)
+                mergedList.push({ ...item, is_mine: true });
+            }
+        }
+
+        // 再加公共新番 (你没追的那些)
+        for (const item of pubAnime) {
+            const id = item.show?.ids?.trakt;
+            if (id && !seenIds.has(id)) {
+                seenIds.add(id);
+                mergedList.push(item);
+            }
+        }
+
+        results = await hydrateTrakt(env, mergedList, 'schedule');
+
+    } else if (tab === 'trakt_hot') {
+        const res = await fetch('https://api.trakt.tv/shows/trending?limit=10', { headers });
+        results = await hydrateTrakt(env, await res.json(), 'trending');
+    } else {
+        const r = await fetch(`https://api.themoviedb.org/3/trending/all/week?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
+        results = (await r.json()).results;
+    }
+    return new Response(JSON.stringify(results), { headers: {'Content-Type': 'application/json'} });
+}
+
 // --- TMDB 补充信息 ---
 async function hydrateTrakt(env, items, typeOverride) {
-    const promises = items.map(async (item) => {
+    // 限制一下并发，防止混合列表过大导致 TMDB 超时
+    const limitedItems = items.slice(0, 35); // 取前35个，避免 Worker 超时
+
+    const promises = limitedItems.map(async (item) => {
         let tmdbId, mediaType, airTime;
         if (item.first_aired) airTime = item.first_aired;
         if (item.watched_at) airTime = item.watched_at;
-        if (item.paused_at) airTime = item.paused_at; // 断点续播时间
+        if (item.paused_at) airTime = item.paused_at;
         
         if (item.show) { tmdbId = item.show.ids.tmdb; mediaType = 'tv'; }
         else if (item.movie) { tmdbId = item.movie.ids.tmdb; mediaType = 'movie'; }
-        else if (item.type === 'show') { tmdbId = item.show.ids.tmdb; mediaType = 'tv'; }
-        else if (item.type === 'movie') { tmdbId = item.movie.ids.tmdb; mediaType = 'movie'; }
         else { tmdbId = item.id; mediaType = item.media_type || 'tv'; }
         
         if (!tmdbId) return null;
@@ -228,7 +279,6 @@ async function hydrateTrakt(env, items, typeOverride) {
             let episodeStill = null;
             let currentProgress = null;
 
-            // 获取单集图片 (针对 History, Calendar, Continue)
             if (mediaType === 'tv' && item.episode) {
                 try {
                     const epRes = await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}/season/${item.episode.season}/episode/${item.episode.number}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
@@ -246,33 +296,12 @@ async function hydrateTrakt(env, items, typeOverride) {
                 runtime_real: d.runtime || (d.episode_run_time ? d.episode_run_time[0] : null),
                 episode_image: episodeStill, next_ep_date: d.next_episode_to_air ? d.next_episode_to_air.air_date : null,
                 last_ep_date: d.last_air_date, total_seasons: d.number_of_seasons, total_episodes: d.number_of_episodes, status: d.status,
-                watch_progress: currentProgress
+                watch_progress: currentProgress,
+                is_tracking: item.is_mine || false // 标记是否在追
             }; 
         } catch { return null; }
     });
     return (await Promise.all(promises)).filter(i => i !== null);
-}
-
-// --- 列表请求 (新番时刻表 保持原样) ---
-async function handleListRequest(env, params) {
-    const tab = params.get('tab') || 'schedule';
-    const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID };
-    let results = [];
-    if (tab === 'schedule') {
-        // 这是公共的“新番时刻表”逻辑，绝对不改
-        const today = new Date().toISOString().split('T')[0];
-        const res = await fetch(`https://api.trakt.tv/calendars/all/shows/${today}/7?extended=full`, { headers });
-        const data = await res.json();
-        const anime = data.filter(i => (i.show?.country === 'jp') && (i.show?.genres?.includes('anime') || i.show?.genres?.includes('animation')));
-        results = await hydrateTrakt(env, anime, 'schedule');
-    } else if (tab === 'trakt_hot') {
-        const res = await fetch('https://api.trakt.tv/shows/trending?limit=10', { headers });
-        results = await hydrateTrakt(env, await res.json(), 'trending');
-    } else {
-        const r = await fetch(`https://api.themoviedb.org/3/trending/all/week?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
-        results = (await r.json()).results;
-    }
-    return new Response(JSON.stringify(results), { headers: {'Content-Type': 'application/json'} });
 }
 
 async function handleUserFavs(env) {
@@ -283,7 +312,7 @@ async function handleUserFavs(env) {
     return new Response(JSON.stringify(detailedList), { headers: {'Content-Type': 'application/json'} });
 }
 
-// ================= 🎨 前端 Vue UI =================
+// ================= 🎨 前端 Vue UI (V11: 追新时刻表) =================
 const htmlContent = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -388,11 +417,9 @@ const htmlContent = `
         </div>
         <div class="page-header">
             <h2 class="page-title">{{ getPageTitle() }}</h2>
-            <!-- ⚡️ 新番时刻表：周历筛选 (保持原样) -->
             <div class="week-grid-tabs" v-if="currentMainTab === 'schedule'">
                  <button v-for="(d, idx) in weekDays" :key="idx" @click="selectedWeekDay = idx" :class="['week-pill', selectedWeekDay === idx ? 'active' : '']">{{ d }}</button>
             </div>
-            <!-- ⚡️ 其他Tab：子菜单 -->
             <div class="sub-tabs" v-else>
                 <button v-for="tab in subTabs" :key="tab.key" @click="currentSubTab = tab.key" :class="['sub-pill', currentSubTab === tab.key ? 'active' : '']">{{ tab.name }}</button>
             </div>
@@ -488,25 +515,24 @@ createApp({
         const weekDays = ['周日','周一','周二','周三','周四','周五','周六'];
         const selectedWeekDay = ref(new Date().getDay()); 
         
-        // ⚡️ V10: 定制 Tab 顺序 (仅修改 'mine')
         const subTabs = computed(() => {
             if (currentMainTab.value === 'mine') return [ 
-                { key: 'continue', name: '继续观看' }, // 对应 Trakt sync/playback
-                { key: 'chase',    name: '我的追番' }, // 对应 Trakt sync/watchlist
-                { key: 'myschedule', name: '即将播出' }, // 对应 Trakt calendars/my (个人)
-                { key: 'history',  name: '播放记录' }  // 对应 Trakt sync/history
+                { key: 'continue', name: '继续观看' },
+                { key: 'chase',    name: '我的追番' },
+                { key: 'myschedule', name: '即将播出' },
+                { key: 'history',  name: '播放记录' } 
             ]; 
-            // 保持 schedule (新番时刻表) 返回空，因为用的是 week-grid
             else if (currentMainTab.value === 'schedule') return []; 
             else return [ { key: 'trakt_hot', name: '热门趋势' }, { key: 'hot', name: '本周热榜' } ];
         });
         
+        // ⚡️ V11: 标题已改为“追新时刻表”
         const getPageTitle = () => { 
-            if(currentMainTab.value === 'schedule') return '新番时刻表'; 
+            if(currentMainTab.value === 'schedule') return '追新时刻表'; 
             const map = { 
                 'continue': '继续观看',
                 'chase': '我的追番', 
-                'myschedule': '即将播出', // 个人日程
+                'myschedule': '即将播出',
                 'history': '播放记录', 
                 'fav_all': 'TMDB收藏',
                 'trakt_hot': 'Trakt 热门', 
@@ -517,12 +543,10 @@ createApp({
         
         const processedList = computed(() => {
             let list = rawData.value;
-            // 类型筛选
             if (filterType.value === 'tv') list = list.filter(i => i.media_type === 'tv');
             if (filterType.value === 'movie') list = list.filter(i => i.media_type === 'movie');
             
-            // ⚡️ 重点：周几筛选只对【公共新番时刻表】生效
-            // 个人的 'myschedule' 不受此影响，直接显示列表
+            // ⚡️ V11: 混合列表同样支持周一到周日筛选
             if (currentMainTab.value === 'schedule') {
                 return list.filter(i => { 
                     const dateStr = i.air_time_iso || i.first_air_date; 
@@ -535,7 +559,6 @@ createApp({
 
         const fetchData = async () => {
             loading.value = true; rawData.value = []; let url = '';
-            // 路由匹配
             if(currentSubTab.value === 'continue') url = '/api/user/continue';
             else if(currentSubTab.value === 'chase') url = '/api/user/watchlist';
             else if(currentSubTab.value === 'myschedule') url = '/api/user/myschedule';
@@ -562,7 +585,8 @@ createApp({
                 if(!res.ok) throw new Error("失败");
                 const map = { 'add_chase': '❤️ 已加入追番', 'remove_chase': '💔 已取消追番', 'add_history': '🎉 标记为已看' };
                 showToast(map[action] || '操作成功');
-                if(currentMainTab.value === 'mine') setTimeout(fetchData, 800);
+                // 刷新数据，因为“追新时刻表”依赖你的个人追番数据
+                setTimeout(fetchData, 800);
             } catch(e) { showToast("❌ 操作失败"); }
         };
 
@@ -574,11 +598,7 @@ createApp({
             else currentSubTab.value = 'trakt_hot'; 
             fetchData(); 
         };
-        watch([currentSubTab, selectedWeekDay], () => { 
-            // 如果是新番时刻表，切换日期时不强制重刷API(前端过滤)，但如果是切Tab则刷新
-            if(currentMainTab.value !== 'schedule') fetchData(); 
-            // 如果是新番时刻表，只在SubTab变化(理论上没有SubTab)时刷新，这里保留逻辑兼容
-        });
+        watch([currentSubTab, selectedWeekDay], () => { if(currentMainTab.value !== 'schedule') fetchData(); });
         watch(currentMainTab, () => { fetchData(); })
 
         const formatSubtitle = (item) => { 
@@ -588,9 +608,7 @@ createApp({
         };
         const formatDuration = (item) => { let t = item.runtime_real || (item.episode_run_time ? item.episode_run_time[0] : 0) || 24; return \`\${t}分钟\`; };
         const formatScheduleInfo = (item) => { 
-            // 个人进度显示
             if (item.watch_progress) return \`已看 \${item.watch_progress}%\`;
-            // 公共新番/个人日程显示
             if (item.status === 'Returning Series' && item.next_ep_date) { const day = new Date(item.next_ep_date).getDay(); const weekStr = ['日','一','二','三','四','五','六'][day]; return \`每周\${weekStr}更新\`; } 
             if (item.status === 'Ended' && item.first_air_date && item.last_ep_date) { const start = item.first_air_date.slice(0,4); const end = item.last_ep_date.slice(0,4); return \`\${start} - \${end}\`; } 
             if(item.release_date) return item.release_date; 
