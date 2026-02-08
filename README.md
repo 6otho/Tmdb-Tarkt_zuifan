@@ -1,191 +1,243 @@
-这是一个完整、连续、没有任何分段的 Markdown 文件代码。请直接点击代码框右上角的“复制”按钮。
+# 📺 Cloudflare Worker - TMDB & Trakt 追番面板（最终定制版 V8）
 
-code
-Markdown
-download
-content_copy
-expand_less
-# 📺 Cloudflare Worker - TMDB & Trakt 追番面板 (最终定制版 V8)
+这是一个基于 **Cloudflare Workers** 的 Serverless 追番管理面板，整合 **TMDB (The Movie Database)** 与 **Trakt.tv**，用于同步追番列表、观看进度与更新日历，并提供一个偏 iOS 风格、适合移动端使用的 Web App（支持 PWA）。
 
-这是一个基于 Cloudflare Workers 的 Serverless 追番管理面板。它结合了 **TMDB** (The Movie Database) 的详细数据和 **Trakt.tv** 的观看进度同步功能，提供了一个美观、丝滑的移动端 Web App。
+---
 
-## ✨ 主要功能
+## ✨ 项目功能
 
-- **无需服务器**：完全运行在 Cloudflare Edge 网络上，免费且速度极快。
-- **双向同步**：
-  - 查看 Trakt 待看列表 (Watchlist)。
-  - 查看 Trakt 播放历史 (History)。
-  - 查看 Trakt 个人日历 (Calendar - 剧集更新提醒)。
-  - 支持 TMDB 收藏夹同步。
-- **交互操作**：直接在页面上“加入/取消追番”或“标记为已看”，数据实时同步回 Trakt。
-- **智能缓存**：使用 Cloudflare KV 缓存请求，加快加载速度并防止 API 超限。
-- **精美 UI**：类似 iOS 原生 App 的设计，支持 PWA（添加到主屏幕）。
+* **无需服务器**：完全运行在 Cloudflare Edge 网络，免费、低延迟、免维护。
+* **Trakt 双向同步**：
+
+  * Watchlist（待看列表）
+  * History（观看历史）
+  * Calendar（剧集更新日历）
+  * 页面内直接加入 / 取消追番、标记已看，实时同步回 Trakt。
+* **TMDB 收藏同步**：同步 TMDB 网站中的收藏内容。
+* **KV 智能缓存**：使用 Cloudflare KV 缓存请求，提升速度并避免 API 超限。
+* **精美 UI**：类 iOS 原生风格，支持添加到主屏幕（PWA）。
 
 ---
 
 ## 🛠️ 准备工作
 
-在开始之前，您需要准备好以下三个平台的账号：
+开始前，请准备以下账号：
 
-1. **Cloudflare**: [https://dash.cloudflare.com/](https://dash.cloudflare.com/) (用于部署代码)
-2. **TMDB**: [https://www.themoviedb.org/](https://www.themoviedb.org/) (用于获取海报和元数据)
-3. **Trakt**: [https://trakt.tv/](https://trakt.tv/) (用于同步观看进度)
-
----
-
-## 🚀 详细部署教程
-
-### 第一步：获取 TMDB API Token
-
-1. 登录 [TMDB 官网](https://www.themoviedb.org/)。
-2. 点击头像 -> **Settings (设置)** -> 左侧菜单 **API**。
-3. 点击 **Create (创建)** -> 选择 **Developer (开发者)**。
-4. 填写必要信息（URL 可以随便填，例如 `http://localhost`），提交申请。
-5. 申请成功后，在 API 页面找到 **API Read Access Token (API 读访问令牌)**。
-   > ⚠️ **注意**：我们需要那个很长的 Token，不是短的 API Key。请记下这个 Token，稍后环境变量名为 `TMDB_TOKEN`。
+1. **Cloudflare**：[https://dash.cloudflare.com/（部署](https://dash.cloudflare.com/（部署) Worker 与 KV）
+2. **TMDB**：[https://www.themoviedb.org/（影视数据与海报）](https://www.themoviedb.org/（影视数据与海报）)
+3. **Trakt**：[https://trakt.tv/（追番与观看进度同步）](https://trakt.tv/（追番与观看进度同步）)
 
 ---
 
-### 第二步：创建 Trakt API 应用
+## 🚀 部署教程（完整流程）
 
-1. 登录 [Trakt 官网](https://trakt.tv/)。
-2. 进入 [Trakt API App 创建页面](https://trakt.tv/oauth/apps)。
+### 一、获取 TMDB API Token
+
+1. 登录 TMDB：[https://www.themoviedb.org/](https://www.themoviedb.org/)
+2. 点击头像 → **Settings** → **API**。
+3. 点击 **Create** → 选择 **Developer**。
+4. 填写申请信息（URL 可填写 `http://localhost`）。
+5. 创建完成后，在 API 页面中找到：
+
+   **API Read Access Token**
+
+⚠️ 注意：
+
+* 必须使用 **API Read Access Token（长 Token）**
+* 不是短的 API Key
+* 后续环境变量名为：`TMDB_TOKEN`
+
+---
+
+### 二、创建 Trakt API 应用
+
+1. 登录 Trakt：[https://trakt.tv/](https://trakt.tv/)
+
+2. 打开应用创建页面：[https://trakt.tv/oauth/apps](https://trakt.tv/oauth/apps)
+
 3. 点击 **NEW APPLICATION**。
-4. 填写信息：
-   - **Name**: 随意（例如 `MyCloudflareTracker`）。
-   - **Redirect URI**: ⚠️ **必须填写** `urn:ietf:wg:oauth:2.0:oob`
-   - **Javascript (CORS) origins**: 留空或填写 `*`。
-5. 保存应用 (Save App)。
-6. 保存成功后，你会看到 `Client ID` 和 `Client Secret`。
-   > ⚠️ **注意**：请记下这两个值，稍后环境变量名为 `TRAKT_ID` 和 `TRAKT_SECRET`。
+
+4. 填写以下信息：
+
+   * **Name**：任意（如 `MyCloudflareTracker`）
+   * **Redirect URI**：
+
+     ```
+     urn:ietf:wg:oauth:2.0:oob
+     ```
+   * **Javascript (CORS) origins**：留空或填写 `*`
+
+5. 保存应用。
+
+6. 记录以下信息：
+
+   * `Client ID`
+   * `Client Secret`
+
+⚠️ 后续环境变量名：
+
+* `TRAKT_ID`
+* `TRAKT_SECRET`
 
 ---
 
-### 第三步：获取 Trakt 初始 Refresh Token (最关键一步)
+### 三、获取 Trakt 初始 Refresh Token（关键步骤）
 
-由于 Worker 是无服务器环境，我们需要手动进行第一次授权来获取一个能够“自我刷新”的 Token。我们使用在线工具 **ReqBin** 来完成，不需要在电脑上敲代码。
+由于 Cloudflare Worker 无法进行交互式登录，需要手动完成一次授权，获取可自动刷新的 Refresh Token。
 
-#### 3.1 获取授权码 (PIN Code)
-将下方链接中的 `您的_CLIENT_ID` 替换为你上一步获取的 `Client ID`，然后在浏览器访问：
+#### 1. 获取授权 PIN Code
 
-```text
-https://trakt.tv/oauth/authorize?response_type=code&client_id=您的_CLIENT_ID&redirect_uri=urn:ietf:wg:oauth:2.0:oob
+将下方链接中的 `YOUR_CLIENT_ID` 替换为你的 Trakt Client ID，然后在浏览器中访问：
 
-点击 Yes 授权，你会在网页上看到一串 8位数的 PIN 码。
+```
+https://trakt.tv/oauth/authorize?response_type=code&client_id=YOUR_CLIENT_ID&redirect_uri=urn:ietf:wg:oauth:2.0:oob
+```
 
-3.2 在线换取 Refresh Token
+* 点击 **Yes** 授权
+* 页面会显示一个 **8 位 PIN 码**
 
-打开在线工具网站：https://reqbin.com/curl
+---
 
-复制下面这段代码，粘贴到网站左边的框里：
+#### 2. 使用在线工具换取 Refresh Token
 
-code
-Bash
-download
-content_copy
-expand_less
+1. 打开在线请求工具：[https://reqbin.com/curl](https://reqbin.com/curl)
+2. 将以下内容粘贴到左侧编辑框：
+
+```bash
 curl -X POST https://api.trakt.tv/oauth/token \
 -H "Content-Type: application/json" \
 -d '{
-  "code": "这里填_8位数_PIN_码",
-  "client_id": "这里填_CLIENT_ID",
-  "client_secret": "这里填_CLIENT_SECRET",
+  "code": "这里填写_8位_PIN",
+  "client_id": "这里填写_CLIENT_ID",
+  "client_secret": "这里填写_CLIENT_SECRET",
   "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
   "grant_type": "authorization_code"
 }'
+```
 
-修改内容：把代码里中文标注的 PIN码、CLIENT_ID 和 CLIENT_SECRET 换成你自己的。
+3. 替换 PIN、Client ID、Client Secret。
+4. 点击 **Run**。
+5. 在返回的 JSON 中找到：
 
-点击 Run 按钮。
+```json
+"refresh_token": "xxxxxxxxxxxxxxxx"
+```
 
-右边窗口会出现一串 JSON 数据，找到 "refresh_token": "..." 这一行。
+⚠️ 注意：
 
-⚠️ 注意：复制那个很长的 refresh token（不要带引号），稍后环境变量名为 TRAKT_INIT_REFRESH。
+* 复制 refresh_token 的值（不带引号）
+* 后续环境变量名为：`TRAKT_INIT_REFRESH`
 
-第四步：Cloudflare Worker 部署
+---
 
-登录 Cloudflare Dashboard。
+### 四、创建并部署 Cloudflare Worker
 
-进入 Workers & Pages -> Create Application -> Create Worker。
+1. 登录 Cloudflare Dashboard。
+2. 进入 **Workers & Pages → Create Application → Create Worker**。
+3. 命名 Worker（如 `my-trakt-app`）。
+4. 点击 **Deploy**。
+5. 点击 **Edit Code**。
+6. 删除默认代码，粘贴项目中的 `worker.js`。
+7. 点击 **Save and Deploy**。
 
-命名你的 Worker（例如 my-trakt-app），点击 Deploy。
+---
 
-点击 Edit code。
+### 五、绑定 KV 数据库（用于缓存）
 
-清空 编辑器里原有的代码，将本项目提供的 worker.js (或者你文件里的代码) 全部粘贴 进去。
+1. 进入 **Workers & Pages → KV**。
+2. 点击 **Create a Namespace**。
+3. 命名为（示例）：
 
-点击右上角 Save and Deploy。
+```
+TRAKT_CACHE
+```
 
-第五步：绑定 KV 数据库 (用于缓存)
+4. 回到 Worker → **Settings → Variables**。
+5. 在 **KV Namespace Bindings** 中添加：
 
-在 Cloudflare Dashboard 左侧菜单找到 Workers & Pages -> KV。
+| 项目            | 值             |
+| ------------- | ------------- |
+| Variable name | `KV`（必须大写）    |
+| KV Namespace  | `TRAKT_CACHE` |
 
-点击 Create a Namespace。
+6. 保存并部署。
 
-名称填写 TRAKT_CACHE (或者随意)，点击 Add。
+---
 
-回到你刚才创建的 Worker 页面 -> Settings (设置) -> Variables (变量)。
+### 六、配置环境变量
 
-找到 KV Namespace Bindings 部分，点击 Add Binding。
+在 **Worker → Settings → Variables → Environment Variables** 中添加以下变量：
 
-Variable name: KV (⚠️必须必须是大写的 KV，这对应代码里的 env.KV)。
+| 变量名                  | 值               | 来源          |
+| -------------------- | --------------- | ----------- |
+| `TRAKT_ID`           | Client ID       | Trakt 应用后台  |
+| `TRAKT_SECRET`       | Client Secret   | Trakt 应用后台  |
+| `TRAKT_INIT_REFRESH` | Refresh Token   | 第三步获取       |
+| `TMDB_TOKEN`         | TMDB Read Token | TMDB API 页面 |
 
-KV Namespace: 选择刚才创建的 TRAKT_CACHE。
+点击 **Save and Deploy**。
 
-点击 Save and Deploy。
+---
 
-第六步：配置环境变量
+## 🎉 完成
 
-在 Worker 的 Settings (设置) -> Variables (变量) -> Environment Variables 部分，添加以下 4 个变量：
+访问你的 Worker 地址，例如：
 
-Variable Name (变量名)	Value (值)	说明
-TRAKT_ID	您的_Client_ID	来自 Trakt 开发者后台
-TRAKT_SECRET	您的_Client_Secret	来自 Trakt 开发者后台
-TRAKT_INIT_REFRESH	您的_Refresh_Token	第三步中通过 ReqBin 获取的那串长字符
-TMDB_TOKEN	您的_TMDB_Read_Token	来自 TMDB 设置页面的长 Token
+```
+https://my-trakt-app.username.workers.dev
+```
 
-点击 Save and Deploy。
+* 首次加载可能较慢（尚未缓存）
+* 后续访问速度极快
 
-🎉 大功告成！
+---
 
-现在，访问你的 Worker 网址（例如 https://my-trakt-app.您的用户名.workers.dev），你应该能看到完整的追番面板了！
+## 💡 使用说明
 
-首次加载可能会稍慢（因为没有缓存），之后浏览会非常快。
+* **新番时刻表**：显示当前播出的动画 / 剧集，按星期排列。
+* **我的**：
 
-💡 使用指南
+  * 继续观看（Calendar）
+  * 播放记录（History）
+  * 我的追番（Watchlist）
+  * TMDB 收藏
+* **发现**：查看热门与趋势内容。
+* **操作方式**：
 
-新番时刻表：显示当前正在播出的动画/剧集，按周几排列。
+  * 点击海报进入详情页
+  * 点击右上角 `...` 呼出快捷菜单
+  * 支持加入追番、标记已看，实时同步至 Trakt
 
-我的：
+---
 
-继续观看 (Calendar)：你正在追的剧，接下来要播出的集数。
+## ❓ 常见问题（FAQ）
 
-播放记录 (History)：你已经在 Trakt 标记看过的记录。
+### 页面显示 `Config Error`
 
-我的追番 (Watchlist)：你添加了但在等待观看的列表。
+请检查：
 
-TMDB 收藏：你在 TMDB 网站点的喜欢。
+* 环境变量是否全部配置
+* 变量名是否全大写
+* 是否存在多余空格
 
-发现：查看热门趋势。
+---
 
-操作：点击任意海报进入详情，或点击海报右上角的 ... 呼出快捷菜单，可以进行“加入追番”或“标记已看”操作，数据会实时同步到 Trakt。
+### 页面显示 `Auth Failed`
 
-❓ 常见问题 (FAQ)
+`TRAKT_INIT_REFRESH` 可能已失效，请重新执行 **第三步** 获取新的 Refresh Token 并更新环境变量。
 
-Q: 页面显示 "Config Error"？
-A: 请检查环境变量（Step 6）是否填写正确，且变量名是否全大写，不能有空格。
+---
 
-Q: 页面显示 "Auth Failed"？
-A: 你的 TRAKT_INIT_REFRESH 可能过期或错误。Trakt 的 Refresh Token 有效期较长，但如果失效，你需要重复 第三步 获取一个新的 Refresh Token 并更新到环境变量中。
+### 图片无法加载
 
-Q: 图片加载不出来？
-A: TMDB 的图片域名 image.tmdb.org 在某些网络环境下可能被阻断。Cloudflare Worker 是在服务器端获取数据的，但图片是客户端（你的浏览器）直接加载的。如果图片挂了，你需要自备科学上网环境。
+TMDB 图片域名 `image.tmdb.org` 在部分网络环境中可能被阻断。图片由客户端直接加载，需要自行解决网络访问问题。
 
-Q: 如何强制刷新数据？
-A: 在你的网址后面加上 /flush (例如 https://...workers.dev/flush) 访问一次，会清空所有缓存。
+---
 
-code
-Code
-download
-content_copy
-expand_less
+### 如何强制刷新缓存
+
+访问以下路径即可清空 KV 缓存：
+
+```
+https://你的Worker地址/flush
+```
