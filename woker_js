@@ -1,13 +1,12 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (V4: 修复 Trakt 鉴权拦截问题)
+ * Cloudflare Worker 追番列表 (V8: 最终定制版 - 四栏布局)
  * ==============================================================================
  */
 
 const TTL_LONG = 3600;
 const TTL_SHORT = 60;
 
-// 🔵 统一的请求头 (包含 User-Agent，防止被 Trakt 拦截)
 const REFLIX_HEADERS = {
     'Content-Type': 'application/json',
     'trakt-api-version': '2',
@@ -20,9 +19,8 @@ export default {
         const url = new URL(request.url);
         const path = url.pathname;
 
-        // 🛡️ 1. API 请求拦截
+        // 🛡️ 1. API 路由分发
         if (path.startsWith('/api')) {
-            // 变量清洗（去除首尾空格，防止复制粘贴带空格）
             const cleanEnv = {
                 KV: env.KV,
                 TRAKT_ID: env.TRAKT_ID?.trim(),
@@ -32,114 +30,110 @@ export default {
             };
 
             if (!cleanEnv.KV || !cleanEnv.TRAKT_ID || !cleanEnv.TRAKT_SECRET || !cleanEnv.TRAKT_INIT_REFRESH) {
-                return new Response(JSON.stringify({ 
-                    error: "Config Error: Missing Variables or KV." 
-                }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                return new Response(JSON.stringify({ error: "Config Error: Check Variables" }), { status: 500 });
             }
 
             try {
-                if (path.includes('/user/calendar')) 
-                    return handleSmartCache(env, ctx, 'calendar', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14));
+                // ⚡️ POST 交互 (加入/取消追番/标记已看)
+                if (request.method === 'POST' && path === '/api/action') {
+                    return await handleUserAction(request, cleanEnv);
+                }
+
+                // ⚡️ GET 获取数据 - 对应前端的四个Tab
+                // 1. 继续观看 -> Calendar (我的剧集更新)
+                if (path.includes('/user/calendar')) return handleSmartCache(env, ctx, 'calendar', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14));
+                // 2. 播放记录 -> History
+                if (path.includes('/user/history')) return handleSmartCache(env, ctx, 'history', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/history', 20));
+                // 3. 我的追番 -> Watchlist
+                if (path.includes('/user/chase')) return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/watchlist'));
+                // 4. TMDB 收藏 -> Favs
+                if (path.includes('/user/favs')) return handleSmartCache(env, ctx, 'favs', TTL_SHORT, () => handleUserFavs(cleanEnv));
                 
-                if (path.includes('/user/favs')) 
-                    return handleSmartCache(env, ctx, 'favs', TTL_SHORT, () => handleUserFavs(cleanEnv));
-                
-                if (path.includes('/user/history')) 
-                    return handleSmartCache(env, ctx, 'history', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/history', 20));
-                
-                if (path.includes('/user/watchlist')) 
-                    return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/watchlist'));
-                
+                // 发现/列表
                 if (path.includes('/list')) {
                     const tab = url.searchParams.get('tab') || 'schedule';
                     return handleSmartCache(env, ctx, `list_${tab}`, TTL_LONG, () => handleListRequest(cleanEnv, url.searchParams));
                 }
 
-                return new Response(JSON.stringify({ error: "API Endpoint Not Found", path }), {
-                    status: 404, headers: { 'Content-Type': 'application/json' }
-                });
+                return new Response(JSON.stringify({ error: "Endpoint Not Found" }), { status: 404 });
 
             } catch (e) {
-                console.error(e);
-                return new Response(JSON.stringify({ error: e.message, stack: e.stack }), { 
-                    status: 500, headers: { 'Content-Type': 'application/json' } 
-                });
+                return new Response(JSON.stringify({ error: e.message }), { status: 500 });
             }
         }
 
-        // 🛡️ 2. 强制清理指令
+        // 🛡️ 2. 缓存清理指令
         if (path === '/flush') {
             await env.KV.delete('TRAKT_AUTH');
-            return new Response("OK: TRAKT_AUTH deleted", {status: 200});
+            await env.KV.delete('watchlist'); 
+            await env.KV.delete('history');   
+            await env.KV.delete('calendar');
+            return new Response("Cache Flushed", {status: 200});
         }
 
-        // 3. 返回前端
-        return new Response(htmlContent, { 
-            headers: { 'content-type': 'text/html;charset=UTF-8' } 
-        });
+        // 3. 返回前端页面
+        return new Response(htmlContent, { headers: { 'content-type': 'text/html;charset=UTF-8' } });
     },
 };
 
-// --- Token 系统 (重点修复区域) ---
+// --- 交互动作处理 ---
+async function handleUserAction(request, env) {
+    const token = await getValidAccessToken(env);
+    const body = await request.json();
+    const { action, item } = body; 
+    
+    let endpoint = '';
+    let payload = {};
+    
+    const mediaObject = { ids: { tmdb: item.id } };
+    if (item.media_type === 'movie') payload = { movies: [mediaObject] };
+    else payload = { shows: [mediaObject] };
+
+    const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
+
+    if (action === 'add_chase') endpoint = 'sync/watchlist';         
+    else if (action === 'remove_chase') endpoint = 'sync/watchlist/remove'; 
+    else if (action === 'add_history') endpoint = 'sync/history';    
+
+    if (!endpoint) return new Response(JSON.stringify({error: "Unknown Action"}), {status: 400});
+
+    const res = await fetch(`https://api.trakt.tv/${endpoint}`, {
+        method: 'POST', headers, body: JSON.stringify(payload)
+    });
+
+    const data = await res.json();
+    
+    // 操作成功后清理缓存
+    if (res.ok) {
+        if (action.includes('chase')) await env.KV.delete('watchlist');
+        if (action.includes('history')) {
+            await env.KV.delete('history');
+            await env.KV.delete('calendar');
+        }
+    }
+
+    return new Response(JSON.stringify(data), { headers: {'Content-Type': 'application/json'} });
+}
+
+// --- Token 管理 ---
 async function getValidAccessToken(env) {
     let authData = await env.KV.get('TRAKT_AUTH', { type: 'json' });
-    
-    // 如果 KV 空，使用初始 Refresh Token
-    if (!authData) {
-        console.log("初始化: 使用 Environment Refresh Token");
-        return await refreshTraktToken(env, env.TRAKT_INIT_REFRESH);
-    }
-    
-    // 检查过期 (提前 10 分钟刷新)
+    if (!authData) return await refreshTraktToken(env, env.TRAKT_INIT_REFRESH);
     const now = Math.floor(Date.now() / 1000);
-    if (now > (authData.created_at + authData.expires_in - 600)) {
-        console.log("Token 过期: 正在刷新...");
-        return await refreshTraktToken(env, authData.refresh_token);
-    }
-    
+    if (now > (authData.created_at + authData.expires_in - 600)) return await refreshTraktToken(env, authData.refresh_token);
     return authData.access_token;
 }
 
 async function refreshTraktToken(env, refreshToken) {
-    console.log("正在向 Trakt 请求刷新 Token...");
-    
-    // 🔥 修复点：添加完整的 User-Agent 和 API Key 头，防止被 Trakt 判定为爬虫并返回 HTML
-    const headers = { 
-        ...REFLIX_HEADERS, 
-        'trakt-api-key': env.TRAKT_ID 
-    };
-
+    const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID };
     const res = await fetch('https://api.trakt.tv/oauth/token', {
-        method: 'POST',
-        headers: headers, // 使用修复后的头
-        body: JSON.stringify({
-            refresh_token: refreshToken,
-            client_id: env.TRAKT_ID,
-            client_secret: env.TRAKT_SECRET,
-            redirect_uri: 'urn:ietf:wg:oauth:2.0:oob',
-            grant_type: 'refresh_token'
-        })
+        method: 'POST', headers,
+        body: JSON.stringify({ refresh_token: refreshToken, client_id: env.TRAKT_ID, client_secret: env.TRAKT_SECRET, redirect_uri: 'urn:ietf:wg:oauth:2.0:oob', grant_type: 'refresh_token' })
     });
-    
-    // 🔥 调试点：先取文本，再试着解析 JSON
-    // 这样如果 Trakt 返回 HTML 错误页，我们能看到内容，而不是报 "Unexpected token <"
     const textData = await res.text();
     let data;
-
-    try {
-        data = JSON.parse(textData);
-    } catch (e) {
-        // 如果解析失败，说明返回的不是 JSON (极有可能是 Cloudflare 拦截页面)
-        console.error("Trakt 返回了非 JSON 内容:", textData.substring(0, 200));
-        throw new Error(`Trakt API 响应格式错误 (可能是 HTML): ${textData.substring(0, 50)}...`);
-    }
-    
-    if (!res.ok) {
-        console.error("Token 刷新失败:", data);
-        throw new Error(`Trakt 拒绝授权: ${data.error_description || JSON.stringify(data)}`);
-    }
-    
-    console.log("Token 刷新成功!");
+    try { data = JSON.parse(textData); } catch (e) { throw new Error(`Trakt Auth Error: ${textData.substring(0,50)}`); }
+    if (!res.ok) throw new Error(`Auth Failed: ${data.error_description}`);
     await env.KV.put('TRAKT_AUTH', JSON.stringify(data));
     return data.access_token;
 }
@@ -147,45 +141,37 @@ async function refreshTraktToken(env, refreshToken) {
 // --- 智能缓存 ---
 async function handleSmartCache(env, ctx, key, ttl, fetcher) {
     if (!env.KV) return fetcher();
-    
     const cached = await env.KV.get(key);
-    // 过滤掉脏数据 (HTML 或空)
-    if (cached && !cached.trim().startsWith('<') && cached.length > 5) {
-        return new Response(cached, { headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' } });
-    }
-    if (cached && cached.trim().startsWith('<')) {
-        await env.KV.delete(key);
-    }
-
+    if (cached && !cached.trim().startsWith('<') && cached.length > 5) return new Response(cached, { headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' } });
+    if (cached && cached.trim().startsWith('<')) await env.KV.delete(key);
     const res = await fetcher();
     if (res.status === 200) {
         const data = await res.clone().text();
-        if (data.trim().startsWith('{') || data.trim().startsWith('[')) {
-            ctx.waitUntil(env.KV.put(key, data, { expirationTtl: ttl }));
-        }
+        if (data.trim().startsWith('{') || data.trim().startsWith('[')) ctx.waitUntil(env.KV.put(key, data, { expirationTtl: ttl }));
     }
     return res;
 }
 
+// --- Trakt 请求处理 ---
 async function handleTraktRequest(env, path, limit) {
     const token = await getValidAccessToken(env);
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
     let url = `https://api.trakt.tv/${path}`;
     
-    if (path.includes('calendars')) url = `${url}/${new Date().toISOString().split('T')[0]}/${limit}`;
+    if (path.includes('watchlist')) url += `?sort=added,desc`; 
     else if (path.includes('history')) url += `?limit=${limit}`;
-    else if (path.includes('watchlist')) url += `?sort=added,asc`;
+    else if (path.includes('calendars')) url = `${url}/${new Date().toISOString().split('T')[0]}/${limit}`;
 
     const res = await fetch(url, { headers });
     const textData = await res.text();
     let data;
-    try { data = JSON.parse(textData); } 
-    catch(e) { throw new Error(`Trakt API 返回 HTML 错误: ${textData.substring(0,50)}`); }
-
-    if (!res.ok) throw new Error(`Trakt API Error ${res.status}: ${JSON.stringify(data)}`);
+    try { data = JSON.parse(textData); } catch(e) { throw new Error("Trakt API Error"); }
+    if (!res.ok) throw new Error(`API Error: ${res.status}`);
     
-    const hydrated = await hydrateTrakt(env, data, path.includes('calendar') ? 'calendar' : (path.includes('watchlist') ? 'watchlist' : 'history'));
+    // 类型映射
+    const typeOverride = path.includes('watchlist') ? 'chase' : (path.includes('history') ? 'history' : 'calendar');
     
+    const hydrated = await hydrateTrakt(env, data, typeOverride);
     if (path.includes('history')) {
         const seen = new Set();
         return new Response(JSON.stringify(hydrated.filter(i => !seen.has(i.id) && seen.add(i.id))), { headers: {'Content-Type': 'application/json'} });
@@ -193,6 +179,7 @@ async function handleTraktRequest(env, path, limit) {
     return new Response(JSON.stringify(hydrated), { headers: {'Content-Type': 'application/json'} });
 }
 
+// --- TMDB 补充信息 ---
 async function hydrateTrakt(env, items, typeOverride) {
     const promises = items.map(async (item) => {
         let tmdbId, mediaType, airTime;
@@ -208,37 +195,22 @@ async function hydrateTrakt(env, items, typeOverride) {
         if (!tmdbId) return null;
 
         try {
-            const r = await fetch(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}?language=zh-CN`, { 
-                headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } 
-            });
+            const r = await fetch(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
             const d = await r.json();
             
             let episodeStill = null;
             if (mediaType === 'tv' && item.episode) {
-                const s = item.episode.season;
-                const e = item.episode.number;
                 try {
-                    const epRes = await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}/season/${s}/episode/${e}?language=zh-CN`, {
-                        headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` }
-                    });
+                    const epRes = await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}/season/${item.episode.season}/episode/${item.episode.number}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
                     const epData = await epRes.json();
                     if(epData.still_path) episodeStill = epData.still_path;
                 } catch(err) {}
             }
-
             return { 
-                ...d, 
-                media_type: mediaType, 
-                trakt_type: typeOverride, 
-                air_time_iso: airTime, 
-                episode_info: item.episode, 
+                ...d, media_type: mediaType, trakt_type: typeOverride, air_time_iso: airTime, episode_info: item.episode, 
                 runtime_real: d.runtime || (d.episode_run_time ? d.episode_run_time[0] : null),
-                episode_image: episodeStill,
-                next_ep_date: d.next_episode_to_air ? d.next_episode_to_air.air_date : null,
-                last_ep_date: d.last_air_date,
-                total_seasons: d.number_of_seasons,
-                total_episodes: d.number_of_episodes,
-                status: d.status
+                episode_image: episodeStill, next_ep_date: d.next_episode_to_air ? d.next_episode_to_air.air_date : null,
+                last_ep_date: d.last_air_date, total_seasons: d.number_of_seasons, total_episodes: d.number_of_episodes, status: d.status
             }; 
         } catch { return null; }
     });
@@ -247,7 +219,6 @@ async function hydrateTrakt(env, items, typeOverride) {
 
 async function handleListRequest(env, params) {
     const tab = params.get('tab') || 'schedule';
-    // 🔥 修复点：List 请求也加上 API Key
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID };
     let results = [];
     if (tab === 'schedule') {
@@ -274,7 +245,7 @@ async function handleUserFavs(env) {
     return new Response(JSON.stringify(detailedList), { headers: {'Content-Type': 'application/json'} });
 }
 
-// ================= 🎨 前端 Vue UI (保持不变) =================
+// ================= 🎨 前端 Vue UI (V8) =================
 const htmlContent = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -288,7 +259,6 @@ const htmlContent = `
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap" rel="stylesheet">
 <style>
-/* CSS 内容不变，省略以节省空间，直接使用之前提供的 CSS 即可 */
   :root {
     --bg-app: #F2F4F6; --bg-desktop: #202020; --accent-purple: #6D28D9; 
     --glass-header: rgba(242, 244, 246, 0.75); --glass-nav: rgba(255, 255, 255, 0.75);
@@ -353,6 +323,18 @@ const htmlContent = `
   .sheet-overview { font-size: 16px; line-height: 1.6; color: #333; margin-bottom: 30px; font-weight: 400; opacity: 0.9; }
   .sheet-btn { width: 100%; padding: 16px; border-radius: 18px; background: #111; color: #fff; font-weight: 800; font-size: 17px; display: flex; justify-content: center; align-items: center; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.25); transition: transform 0.2s; } .sheet-btn:active { transform: scale(0.98); }
   .loading-box { display: flex; justify-content: center; padding-top: 200px; color: #888; }
+  
+  .action-menu-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.4); z-index: 200; display: flex; flex-direction: column; justify-content: flex-end; animation: fadeIn 0.2s; }
+  .action-sheet { background: #fff; border-radius: 24px 24px 0 0; padding: 20px; padding-bottom: calc(20px + env(safe-area-inset-bottom)); animation: slideUp 0.3s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .action-btn { display: flex; align-items: center; gap: 12px; padding: 16px; font-size: 16px; font-weight: 600; color: #333; border-bottom: 1px solid #f0f0f0; }
+  .action-btn:last-child { border-bottom: none; }
+  .action-btn:active { background: #f5f5f5; border-radius: 12px; }
+  .action-btn.danger { color: #ef4444; }
+  .action-btn i { width: 24px; text-align: center; font-size: 18px; }
+  
+  .toast-box { position: absolute; top: 110px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.85); color: #fff; padding: 10px 20px; border-radius: 50px; font-size: 13px; font-weight: 600; z-index: 300; display: flex; align-items: center; gap: 8px; backdrop-filter: blur(10px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); animation: toastPop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+  @keyframes toastPop { from { transform: translate(-50%, 20px) scale(0.9); opacity: 0; } to { transform: translate(-50%, 0) scale(1); opacity: 1; } }
+  .more-btn-area { position: absolute; top: 0; right: 0; width: 50px; height: 50px; display: flex; justify-content: center; align-items: center; z-index: 10; color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
 </style>
 </head>
 <body>
@@ -376,6 +358,9 @@ const htmlContent = `
             </div>
         </div>
     </div>
+    
+    <div v-if="toastMsg" class="toast-box"><i class="fas fa-info-circle text-blue-400"></i> {{ toastMsg }}</div>
+
     <div class="scroll-content">
         <div v-if="loading" class="loading-box"><i class="fas fa-circle-notch fa-spin fa-2x"></i></div>
         <div v-else class="list-container">
@@ -385,7 +370,7 @@ const htmlContent = `
                 <div class="card-body">
                     <img :src="getPoster(item)" class="poster-thumb" loading="lazy">
                     <div class="info-col">
-                        <div style="position:absolute; top:0; right:10px; color:#fff; text-shadow:0 1px 3px rgba(0,0,0,0.6);"><i class="fas fa-ellipsis-h"></i></div>
+                        <div class="more-btn-area" @click.stop="openMenu(item)"><i class="fas fa-ellipsis-h"></i></div>
                         <div class="title-txt">{{ item.name || item.title }}</div>
                         <div class="subtitle-txt">{{ formatSubtitle(item) }}</div>
                         <div class="status-txt"><i class="far fa-calendar-check"></i> {{ formatScheduleInfo(item) }}</div>
@@ -405,6 +390,7 @@ const htmlContent = `
         <div @click="switchMainTab('schedule')" :class="['nav-btn', currentMainTab === 'schedule' ? 'active' : '']"><i class="far fa-calendar-alt"></i><span>新番</span></div>
         <div @click="switchMainTab('mine')" :class="['nav-btn', currentMainTab === 'mine' ? 'active' : '']"><img src="https://ui-avatars.com/api/?name=Me&background=random&color=fff" class="user-avatar"><span>我的</span></div>
     </div>
+
     <div v-if="selectedItem" class="modal-overlay" @click.self="selectedItem = null">
         <div class="detail-sheet">
             <div class="sheet-header">
@@ -414,21 +400,39 @@ const htmlContent = `
             <div class="sheet-body">
                 <h2 class="sheet-title">{{ selectedItem.name || selectedItem.title }}</h2>
                 <div class="rating-row">
-                    <div class="rating-badge tmdb"><img src="https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg" class="platform-logo"><i class="fas fa-star" style="color:#F5C518; font-size:11px;"></i><span class="score-val">{{ selectedItem.vote_average?.toFixed(1) || '0.0' }}</span></div>
-                    <div class="rating-badge trakt" v-if="selectedItem.vote_count"><img src="https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg" class="platform-logo"><i class="fas fa-heart" style="color:#ed1c24; font-size:11px;"></i><span class="score-val" style="color:#333">{{ formatVotes(selectedItem.vote_count) }}</span></div>
+                    <div class="rating-badge tmdb"><img src="https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg" class="platform-logo"><span class="score-val">{{ selectedItem.vote_average?.toFixed(1) || '0.0' }}</span></div>
+                    <div class="rating-badge trakt" v-if="selectedItem.vote_count"><img src="https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg" class="platform-logo"><span class="score-val" style="color:#333">{{ formatVotes(selectedItem.vote_count) }}</span></div>
                 </div>
                 <div class="genre-row" v-if="selectedItem.genres && selectedItem.genres.length"><span v-for="g in selectedItem.genres" :key="g.id" class="genre-pill">{{ g.name }}</span></div>
                 <div class="sheet-info-grid">
                     <div class="info-item" v-if="selectedItem.runtime_real"><i class="far fa-clock"></i> {{ selectedItem.runtime_real }}分钟</div>
-                    <div class="info-item"><i class="far fa-calendar"></i> {{ (selectedItem.first_air_date || selectedItem.release_date || '').slice(0,4) }}</div>
                     <div class="info-item">{{ formatSubtitle(selectedItem) }}</div>
                 </div>
                 <p class="sheet-overview">{{ selectedItem.overview || '暂无简介...' }}</p>
-                <div class="sheet-btn"><i class="fas fa-play"></i> 立即播放</div>
+                <div class="sheet-btn" @click="performAction('add_chase', selectedItem)"><i class="fas fa-heart"></i> 加入我的追番</div>
             </div>
         </div>
     </div>
+
+    <!-- ⚡️ V8 增强菜单 -->
+    <div v-if="menuItem" class="action-menu-overlay" @click.self="menuItem = null">
+        <div class="action-sheet">
+            <div style="font-size:18px; font-weight:800; margin-bottom:15px; padding:0 10px; color:#111;">{{ menuItem.name || menuItem.title }}</div>
+            
+            <div class="action-btn" @click="performAction('add_chase', menuItem)">
+                <i class="fas fa-heart text-red-500"></i> 加入追番 (Tracking)
+            </div>
+            <div class="action-btn" @click="performAction('remove_chase', menuItem)">
+                <i class="fas fa-ban text-gray-500"></i> 取消追番 (Untrack)
+            </div>
+            <div class="action-btn" @click="performAction('add_history', menuItem)">
+                <i class="fas fa-check-circle text-green-500"></i> 标记为已看 (Watched)
+            </div>
+            <div class="action-btn" @click="menuItem = null" style="justify-content:center; color:#666; font-weight:500; margin-top:10px; border:none;">关闭</div>
+        </div>
+    </div>
 </div>
+
 <script>
 const { createApp, ref, computed, onMounted, watch } = Vue;
 createApp({
@@ -440,26 +444,39 @@ createApp({
         const loading = ref(false);
         const rawData = ref([]);
         const selectedItem = ref(null);
+        const menuItem = ref(null);
+        const toastMsg = ref('');
         const weekDays = ['周日','周一','周二','周三','周四','周五','周六'];
         const selectedWeekDay = ref(new Date().getDay()); 
+        
+        // ⚡️ V8: 最终定制 Tab 顺序
         const subTabs = computed(() => {
-            if (currentMainTab.value === 'mine') { return [ { key: 'watching', name: '继续观看' }, { key: 'fav_week', name: '待看列表' }, { key: 'watchlist', name: '稍后观看' }, { key: 'fav_all', name: '全部收藏' } ]; } 
-            else if (currentMainTab.value === 'schedule') { return []; } 
-            else { return [ { key: 'trakt_hot', name: '热门趋势' }, { key: 'hot', name: '本周热榜' } ]; }
+            if (currentMainTab.value === 'mine') return [ 
+                { key: 'calendar', name: '继续观看' }, // 对应 Trakt Calendar (剧集更新)
+                { key: 'history', name: '播放记录' },  // 对应 Trakt History (已看)
+                { key: 'chase', name: '我的追番' },    // 对应 Trakt Watchlist (想看)
+                { key: 'fav_all', name: 'TMDB收藏' }   // 对应 TMDB Favs
+            ]; 
+            else if (currentMainTab.value === 'schedule') return []; 
+            else return [ { key: 'trakt_hot', name: '热门趋势' }, { key: 'hot', name: '本周热榜' } ];
         });
-        const getPageTitle = () => { if(currentMainTab.value === 'schedule') return '新番时刻表'; const map = { 'watching': '继续观看', 'fav_week': '待看列表', 'watchlist': '稍后观看', 'fav_all': '我的收藏', 'trakt_hot': 'Trakt 热门', 'hot': 'TMDB 热榜' }; return map[currentSubTab.value] || '发现'; };
+        
+        const getPageTitle = () => { if(currentMainTab.value === 'schedule') return '新番时刻表'; const map = { 'history': '播放记录', 'chase': '我的追番', 'calendar': '继续观看', 'fav_all': 'TMDB收藏', 'trakt_hot': 'Trakt 热门', 'hot': 'TMDB 热榜' }; return map[currentSubTab.value] || '发现'; };
+        
         const processedList = computed(() => {
             let list = rawData.value;
             if (filterType.value === 'tv') list = list.filter(i => i.media_type === 'tv');
             if (filterType.value === 'movie') list = list.filter(i => i.media_type === 'movie');
-            if (currentMainTab.value === 'schedule') { return list.filter(i => { const dateStr = i.air_time_iso || i.first_air_date; if(!dateStr) return false; return new Date(dateStr).getDay() === selectedWeekDay.value; }); }
+            if (currentMainTab.value === 'schedule') return list.filter(i => { const dateStr = i.air_time_iso || i.first_air_date; if(!dateStr) return false; return new Date(dateStr).getDay() === selectedWeekDay.value; });
             return list;
         });
+
         const fetchData = async () => {
             loading.value = true; rawData.value = []; let url = '';
-            if(currentSubTab.value === 'fav_week') url = '/api/user/calendar'; 
-            else if(currentSubTab.value === 'watching') url = '/api/user/history';
-            else if(currentSubTab.value === 'watchlist') url = '/api/user/watchlist';
+            // 路由匹配
+            if(currentSubTab.value === 'chase') url = '/api/user/chase';
+            else if(currentSubTab.value === 'history') url = '/api/user/history';
+            else if(currentSubTab.value === 'calendar') url = '/api/user/calendar';
             else if(currentSubTab.value === 'fav_all') url = '/api/user/favs';
             else url = \`/api/list?tab=\${currentSubTab.value}\`;
             try {
@@ -469,10 +486,32 @@ createApp({
                 rawData.value = Array.isArray(data) ? data : (data.results || []);
             } catch(e) { console.error(e); } finally { loading.value = false; }
         };
-        const switchMainTab = (tab) => { currentMainTab.value = tab; if(tab === 'mine') currentSubTab.value = 'watching'; else if(tab === 'schedule') currentSubTab.value = 'schedule'; else currentSubTab.value = 'trakt_hot'; fetchData(); };
+
+        const performAction = async (action, item) => {
+            menuItem.value = null; selectedItem.value = null;
+            showToast("正在提交...");
+            try {
+                const res = await fetch('/api/action', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ action, item })
+                });
+                if(!res.ok) throw new Error("失败");
+                const map = { 'add_chase': '❤️ 已加入追番', 'remove_chase': '💔 已取消追番', 'add_history': '🎉 标记为已看' };
+                showToast(map[action] || '操作成功');
+                if(currentMainTab.value === 'mine') setTimeout(fetchData, 800);
+            } catch(e) { showToast("❌ 操作失败"); }
+        };
+
+        const showToast = (msg) => { toastMsg.value = msg; setTimeout(() => toastMsg.value = '', 2500); };
+        const switchMainTab = (tab) => { currentMainTab.value = tab; if(tab === 'mine') currentSubTab.value = 'calendar'; else if(tab === 'schedule') currentSubTab.value = 'schedule'; else currentSubTab.value = 'trakt_hot'; fetchData(); };
         watch([currentSubTab, selectedWeekDay], () => { if(currentMainTab.value !== 'schedule') fetchData(); });
         watch(currentMainTab, () => { fetchData(); })
-        const formatSubtitle = (item) => { if (item.episode_info) { return \`S\${item.episode_info.season} • E\${item.episode_info.number}\`; } if (item.total_episodes) return \`共 \${item.total_episodes} 集\`; return item.original_name || item.title || 'Movie'; };
+
+        const formatSubtitle = (item) => { 
+            if (item.episode_info) return \`第\${item.episode_info.season}季 • 第\${item.episode_info.number}集\`; 
+            if (item.total_episodes) return \`共 \${item.total_episodes} 集\`; 
+            return item.original_name || item.title || 'Movie'; 
+        };
         const formatDuration = (item) => { let t = item.runtime_real || (item.episode_run_time ? item.episode_run_time[0] : 0) || 24; return \`\${t}分钟\`; };
         const formatScheduleInfo = (item) => { if (item.status === 'Returning Series' && item.next_ep_date) { const day = new Date(item.next_ep_date).getDay(); const weekStr = ['日','一','二','三','四','五','六'][day]; return \`每周\${weekStr}更新\`; } if (item.status === 'Ended' && item.first_air_date && item.last_ep_date) { const start = item.first_air_date.slice(0,4); const end = item.last_ep_date.slice(0,4); return \`\${start} - \${end}\`; } if(item.release_date) return item.release_date; if(item.first_air_date) return \`首播: \${item.first_air_date}\`; return '未知日程'; };
         const formatCapsuleRight = (item) => { if (item.air_time_iso) { const date = new Date(item.air_time_iso); const h = date.getHours().toString().padStart(2, '0'); const m = date.getMinutes().toString().padStart(2, '0'); return \`\${h}:\${m} 播放\`; } if (item.next_ep_date) { const d = new Date(item.next_ep_date); const m = (d.getMonth()+1).toString().padStart(2, '0'); const day = d.getDate().toString().padStart(2, '0'); return \`\${m}/\${day} 更新\`; } if (item.status === 'Returning Series' && item.last_ep_date) { const d = new Date(item.last_ep_date); const m = (d.getMonth()+1).toString().padStart(2, '0'); const day = d.getDate().toString().padStart(2, '0'); return \`\${m}/\${day} 更新\`; } if(item.status === 'Ended') return '已完结'; if(item.release_date) return item.release_date.slice(0,4); return '待定'; };
@@ -480,8 +519,9 @@ createApp({
         const getPoster = (i) => i.poster_path ? TMDB_IMG + 'w200' + i.poster_path : 'https://via.placeholder.com/200x300/e0e0e0/ffffff?text=No+Poster';
         const getBackdrop = (i) => { if (i.episode_image) return TMDB_IMG + 'w780' + i.episode_image; if (i.backdrop_path) return TMDB_IMG + 'w780' + i.backdrop_path; return 'https://via.placeholder.com/600x340/e0e0e0/ffffff?text=TMDB&Trakt追新'; };
         const openModal = (item) => { selectedItem.value = item; };
+        const openMenu = (item) => { menuItem.value = item; }; 
         onMounted(() => fetchData());
-        return { currentMainTab, switchMainTab, currentSubTab, subTabs, filterType, weekDays, selectedWeekDay, loading, processedList, getPageTitle, selectedItem, openModal, getPoster, getBackdrop, formatSubtitle, formatDuration, formatScheduleInfo, formatCapsuleRight, formatVotes };
+        return { currentMainTab, switchMainTab, currentSubTab, subTabs, filterType, weekDays, selectedWeekDay, loading, processedList, getPageTitle, selectedItem, menuItem, toastMsg, openModal, openMenu, performAction, getPoster, getBackdrop, formatSubtitle, formatDuration, formatScheduleInfo, formatCapsuleRight, formatVotes };
     }
 }).mount('#app-container');
 </script>
