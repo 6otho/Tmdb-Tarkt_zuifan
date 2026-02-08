@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (V8: 最终定制版 - 四栏布局)
+ * Cloudflare Worker 追番列表 (V10: 修复版 - 严保新番时刻表，只改个人主页)
  * ==============================================================================
  */
 
@@ -39,17 +39,36 @@ export default {
                     return await handleUserAction(request, cleanEnv);
                 }
 
-                // ⚡️ GET 获取数据 - 对应前端的四个Tab
-                // 1. 继续观看 -> Calendar (我的剧集更新)
-                if (path.includes('/user/calendar')) return handleSmartCache(env, ctx, 'calendar', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14));
-                // 2. 播放记录 -> History
-                if (path.includes('/user/history')) return handleSmartCache(env, ctx, 'history', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/history', 20));
-                // 3. 我的追番 -> Watchlist
-                if (path.includes('/user/chase')) return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/watchlist'));
-                // 4. TMDB 收藏 -> Favs
+                // ⚡️ GET 获取数据 - [我的] 页面的四个专属接口
+                
+                // 1. 继续观看 (Continue Watching) -> sync/playback
+                if (path.includes('/user/continue')) {
+                    return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, 
+                        () => handleTraktRequest(cleanEnv, 'sync/playback', 20));
+                }
+
+                // 2. 我的追番 (Start Watching) -> sync/watchlist
+                if (path.includes('/user/watchlist')) {
+                    return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, 
+                        () => handleTraktRequest(cleanEnv, 'sync/watchlist'));
+                }
+
+                // 3. 即将播出 (Upcoming Schedule) -> calendars/my/shows
+                if (path.includes('/user/myschedule')) {
+                    return handleSmartCache(env, ctx, 'my_schedule', TTL_SHORT, 
+                        () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14)); // 未来14天
+                }
+
+                // 4. 播放记录 (History) -> sync/history
+                if (path.includes('/user/history')) {
+                    return handleSmartCache(env, ctx, 'history', TTL_SHORT, 
+                        () => handleTraktRequest(cleanEnv, 'sync/history', 20));
+                }
+                
+                // 5. TMDB 收藏 (保留)
                 if (path.includes('/user/favs')) return handleSmartCache(env, ctx, 'favs', TTL_SHORT, () => handleUserFavs(cleanEnv));
                 
-                // 发现/列表
+                // ⚡️ 公共列表 (发现/新番时刻表) - 保持原样，不动这里的逻辑
                 if (path.includes('/list')) {
                     const tab = url.searchParams.get('tab') || 'schedule';
                     return handleSmartCache(env, ctx, `list_${tab}`, TTL_LONG, () => handleListRequest(cleanEnv, url.searchParams));
@@ -67,7 +86,8 @@ export default {
             await env.KV.delete('TRAKT_AUTH');
             await env.KV.delete('watchlist'); 
             await env.KV.delete('history');   
-            await env.KV.delete('calendar');
+            await env.KV.delete('my_schedule');
+            await env.KV.delete('continue_watching');
             return new Response("Cache Flushed", {status: 200});
         }
 
@@ -108,7 +128,7 @@ async function handleUserAction(request, env) {
         if (action.includes('chase')) await env.KV.delete('watchlist');
         if (action.includes('history')) {
             await env.KV.delete('history');
-            await env.KV.delete('calendar');
+            await env.KV.delete('continue_watching');
         }
     }
 
@@ -152,7 +172,7 @@ async function handleSmartCache(env, ctx, key, ttl, fetcher) {
     return res;
 }
 
-// --- Trakt 请求处理 ---
+// --- Trakt 请求处理 (个人数据) ---
 async function handleTraktRequest(env, path, limit) {
     const token = await getValidAccessToken(env);
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
@@ -160,6 +180,7 @@ async function handleTraktRequest(env, path, limit) {
     
     if (path.includes('watchlist')) url += `?sort=added,desc`; 
     else if (path.includes('history')) url += `?limit=${limit}`;
+    else if (path.includes('playback')) url += `?limit=${limit}`; // 断点续播
     else if (path.includes('calendars')) url = `${url}/${new Date().toISOString().split('T')[0]}/${limit}`;
 
     const res = await fetch(url, { headers });
@@ -168,10 +189,15 @@ async function handleTraktRequest(env, path, limit) {
     try { data = JSON.parse(textData); } catch(e) { throw new Error("Trakt API Error"); }
     if (!res.ok) throw new Error(`API Error: ${res.status}`);
     
-    // 类型映射
-    const typeOverride = path.includes('watchlist') ? 'chase' : (path.includes('history') ? 'history' : 'calendar');
+    // 类型标记，用于前端显示
+    let typeOverride = 'default';
+    if (path.includes('watchlist')) typeOverride = 'chase';
+    else if (path.includes('history')) typeOverride = 'history';
+    else if (path.includes('playback')) typeOverride = 'continue';
+    else if (path.includes('calendars')) typeOverride = 'myschedule';
     
     const hydrated = await hydrateTrakt(env, data, typeOverride);
+    
     if (path.includes('history')) {
         const seen = new Set();
         return new Response(JSON.stringify(hydrated.filter(i => !seen.has(i.id) && seen.add(i.id))), { headers: {'Content-Type': 'application/json'} });
@@ -185,6 +211,7 @@ async function hydrateTrakt(env, items, typeOverride) {
         let tmdbId, mediaType, airTime;
         if (item.first_aired) airTime = item.first_aired;
         if (item.watched_at) airTime = item.watched_at;
+        if (item.paused_at) airTime = item.paused_at; // 断点续播时间
         
         if (item.show) { tmdbId = item.show.ids.tmdb; mediaType = 'tv'; }
         else if (item.movie) { tmdbId = item.movie.ids.tmdb; mediaType = 'movie'; }
@@ -199,6 +226,9 @@ async function hydrateTrakt(env, items, typeOverride) {
             const d = await r.json();
             
             let episodeStill = null;
+            let currentProgress = null;
+
+            // 获取单集图片 (针对 History, Calendar, Continue)
             if (mediaType === 'tv' && item.episode) {
                 try {
                     const epRes = await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}/season/${item.episode.season}/episode/${item.episode.number}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
@@ -206,22 +236,30 @@ async function hydrateTrakt(env, items, typeOverride) {
                     if(epData.still_path) episodeStill = epData.still_path;
                 } catch(err) {}
             }
+            
+            if (typeOverride === 'continue' && item.progress) {
+                currentProgress = item.progress;
+            }
+
             return { 
                 ...d, media_type: mediaType, trakt_type: typeOverride, air_time_iso: airTime, episode_info: item.episode, 
                 runtime_real: d.runtime || (d.episode_run_time ? d.episode_run_time[0] : null),
                 episode_image: episodeStill, next_ep_date: d.next_episode_to_air ? d.next_episode_to_air.air_date : null,
-                last_ep_date: d.last_air_date, total_seasons: d.number_of_seasons, total_episodes: d.number_of_episodes, status: d.status
+                last_ep_date: d.last_air_date, total_seasons: d.number_of_seasons, total_episodes: d.number_of_episodes, status: d.status,
+                watch_progress: currentProgress
             }; 
         } catch { return null; }
     });
     return (await Promise.all(promises)).filter(i => i !== null);
 }
 
+// --- 列表请求 (新番时刻表 保持原样) ---
 async function handleListRequest(env, params) {
     const tab = params.get('tab') || 'schedule';
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID };
     let results = [];
     if (tab === 'schedule') {
+        // 这是公共的“新番时刻表”逻辑，绝对不改
         const today = new Date().toISOString().split('T')[0];
         const res = await fetch(`https://api.trakt.tv/calendars/all/shows/${today}/7?extended=full`, { headers });
         const data = await res.json();
@@ -245,7 +283,7 @@ async function handleUserFavs(env) {
     return new Response(JSON.stringify(detailedList), { headers: {'Content-Type': 'application/json'} });
 }
 
-// ================= 🎨 前端 Vue UI (V8) =================
+// ================= 🎨 前端 Vue UI =================
 const htmlContent = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -350,9 +388,11 @@ const htmlContent = `
         </div>
         <div class="page-header">
             <h2 class="page-title">{{ getPageTitle() }}</h2>
+            <!-- ⚡️ 新番时刻表：周历筛选 (保持原样) -->
             <div class="week-grid-tabs" v-if="currentMainTab === 'schedule'">
                  <button v-for="(d, idx) in weekDays" :key="idx" @click="selectedWeekDay = idx" :class="['week-pill', selectedWeekDay === idx ? 'active' : '']">{{ d }}</button>
             </div>
+            <!-- ⚡️ 其他Tab：子菜单 -->
             <div class="sub-tabs" v-else>
                 <button v-for="tab in subTabs" :key="tab.key" @click="currentSubTab = tab.key" :class="['sub-pill', currentSubTab === tab.key ? 'active' : '']">{{ tab.name }}</button>
             </div>
@@ -414,7 +454,6 @@ const htmlContent = `
         </div>
     </div>
 
-    <!-- ⚡️ V8 增强菜单 -->
     <div v-if="menuItem" class="action-menu-overlay" @click.self="menuItem = null">
         <div class="action-sheet">
             <div style="font-size:18px; font-weight:800; margin-bottom:15px; padding:0 10px; color:#111;">{{ menuItem.name || menuItem.title }}</div>
@@ -449,36 +488,61 @@ createApp({
         const weekDays = ['周日','周一','周二','周三','周四','周五','周六'];
         const selectedWeekDay = ref(new Date().getDay()); 
         
-        // ⚡️ V8: 最终定制 Tab 顺序
+        // ⚡️ V10: 定制 Tab 顺序 (仅修改 'mine')
         const subTabs = computed(() => {
             if (currentMainTab.value === 'mine') return [ 
-                { key: 'calendar', name: '继续观看' }, // 对应 Trakt Calendar (剧集更新)
-                { key: 'history', name: '播放记录' },  // 对应 Trakt History (已看)
-                { key: 'chase', name: '我的追番' },    // 对应 Trakt Watchlist (想看)
-                { key: 'fav_all', name: 'TMDB收藏' }   // 对应 TMDB Favs
+                { key: 'continue', name: '继续观看' }, // 对应 Trakt sync/playback
+                { key: 'chase',    name: '我的追番' }, // 对应 Trakt sync/watchlist
+                { key: 'myschedule', name: '即将播出' }, // 对应 Trakt calendars/my (个人)
+                { key: 'history',  name: '播放记录' }  // 对应 Trakt sync/history
             ]; 
+            // 保持 schedule (新番时刻表) 返回空，因为用的是 week-grid
             else if (currentMainTab.value === 'schedule') return []; 
             else return [ { key: 'trakt_hot', name: '热门趋势' }, { key: 'hot', name: '本周热榜' } ];
         });
         
-        const getPageTitle = () => { if(currentMainTab.value === 'schedule') return '新番时刻表'; const map = { 'history': '播放记录', 'chase': '我的追番', 'calendar': '继续观看', 'fav_all': 'TMDB收藏', 'trakt_hot': 'Trakt 热门', 'hot': 'TMDB 热榜' }; return map[currentSubTab.value] || '发现'; };
+        const getPageTitle = () => { 
+            if(currentMainTab.value === 'schedule') return '新番时刻表'; 
+            const map = { 
+                'continue': '继续观看',
+                'chase': '我的追番', 
+                'myschedule': '即将播出', // 个人日程
+                'history': '播放记录', 
+                'fav_all': 'TMDB收藏',
+                'trakt_hot': 'Trakt 热门', 
+                'hot': 'TMDB 热榜' 
+            }; 
+            return map[currentSubTab.value] || '发现'; 
+        };
         
         const processedList = computed(() => {
             let list = rawData.value;
+            // 类型筛选
             if (filterType.value === 'tv') list = list.filter(i => i.media_type === 'tv');
             if (filterType.value === 'movie') list = list.filter(i => i.media_type === 'movie');
-            if (currentMainTab.value === 'schedule') return list.filter(i => { const dateStr = i.air_time_iso || i.first_air_date; if(!dateStr) return false; return new Date(dateStr).getDay() === selectedWeekDay.value; });
+            
+            // ⚡️ 重点：周几筛选只对【公共新番时刻表】生效
+            // 个人的 'myschedule' 不受此影响，直接显示列表
+            if (currentMainTab.value === 'schedule') {
+                return list.filter(i => { 
+                    const dateStr = i.air_time_iso || i.first_air_date; 
+                    if(!dateStr) return false; 
+                    return new Date(dateStr).getDay() === selectedWeekDay.value; 
+                });
+            }
             return list;
         });
 
         const fetchData = async () => {
             loading.value = true; rawData.value = []; let url = '';
             // 路由匹配
-            if(currentSubTab.value === 'chase') url = '/api/user/chase';
+            if(currentSubTab.value === 'continue') url = '/api/user/continue';
+            else if(currentSubTab.value === 'chase') url = '/api/user/watchlist';
+            else if(currentSubTab.value === 'myschedule') url = '/api/user/myschedule';
             else if(currentSubTab.value === 'history') url = '/api/user/history';
-            else if(currentSubTab.value === 'calendar') url = '/api/user/calendar';
             else if(currentSubTab.value === 'fav_all') url = '/api/user/favs';
             else url = \`/api/list?tab=\${currentSubTab.value}\`;
+            
             try {
                 const res = await fetch(url);
                 const data = await res.json();
@@ -503,18 +567,49 @@ createApp({
         };
 
         const showToast = (msg) => { toastMsg.value = msg; setTimeout(() => toastMsg.value = '', 2500); };
-        const switchMainTab = (tab) => { currentMainTab.value = tab; if(tab === 'mine') currentSubTab.value = 'calendar'; else if(tab === 'schedule') currentSubTab.value = 'schedule'; else currentSubTab.value = 'trakt_hot'; fetchData(); };
-        watch([currentSubTab, selectedWeekDay], () => { if(currentMainTab.value !== 'schedule') fetchData(); });
+        const switchMainTab = (tab) => { 
+            currentMainTab.value = tab; 
+            if(tab === 'mine') currentSubTab.value = 'continue'; 
+            else if(tab === 'schedule') currentSubTab.value = 'schedule'; 
+            else currentSubTab.value = 'trakt_hot'; 
+            fetchData(); 
+        };
+        watch([currentSubTab, selectedWeekDay], () => { 
+            // 如果是新番时刻表，切换日期时不强制重刷API(前端过滤)，但如果是切Tab则刷新
+            if(currentMainTab.value !== 'schedule') fetchData(); 
+            // 如果是新番时刻表，只在SubTab变化(理论上没有SubTab)时刷新，这里保留逻辑兼容
+        });
         watch(currentMainTab, () => { fetchData(); })
 
         const formatSubtitle = (item) => { 
-            if (item.episode_info) return \`第\${item.episode_info.season}季 • 第\${item.episode_info.number}集\`; 
+            if (item.episode_info) return \`S\${item.episode_info.season} E\${item.episode_info.number}\`; 
             if (item.total_episodes) return \`共 \${item.total_episodes} 集\`; 
             return item.original_name || item.title || 'Movie'; 
         };
         const formatDuration = (item) => { let t = item.runtime_real || (item.episode_run_time ? item.episode_run_time[0] : 0) || 24; return \`\${t}分钟\`; };
-        const formatScheduleInfo = (item) => { if (item.status === 'Returning Series' && item.next_ep_date) { const day = new Date(item.next_ep_date).getDay(); const weekStr = ['日','一','二','三','四','五','六'][day]; return \`每周\${weekStr}更新\`; } if (item.status === 'Ended' && item.first_air_date && item.last_ep_date) { const start = item.first_air_date.slice(0,4); const end = item.last_ep_date.slice(0,4); return \`\${start} - \${end}\`; } if(item.release_date) return item.release_date; if(item.first_air_date) return \`首播: \${item.first_air_date}\`; return '未知日程'; };
-        const formatCapsuleRight = (item) => { if (item.air_time_iso) { const date = new Date(item.air_time_iso); const h = date.getHours().toString().padStart(2, '0'); const m = date.getMinutes().toString().padStart(2, '0'); return \`\${h}:\${m} 播放\`; } if (item.next_ep_date) { const d = new Date(item.next_ep_date); const m = (d.getMonth()+1).toString().padStart(2, '0'); const day = d.getDate().toString().padStart(2, '0'); return \`\${m}/\${day} 更新\`; } if (item.status === 'Returning Series' && item.last_ep_date) { const d = new Date(item.last_ep_date); const m = (d.getMonth()+1).toString().padStart(2, '0'); const day = d.getDate().toString().padStart(2, '0'); return \`\${m}/\${day} 更新\`; } if(item.status === 'Ended') return '已完结'; if(item.release_date) return item.release_date.slice(0,4); return '待定'; };
+        const formatScheduleInfo = (item) => { 
+            // 个人进度显示
+            if (item.watch_progress) return \`已看 \${item.watch_progress}%\`;
+            // 公共新番/个人日程显示
+            if (item.status === 'Returning Series' && item.next_ep_date) { const day = new Date(item.next_ep_date).getDay(); const weekStr = ['日','一','二','三','四','五','六'][day]; return \`每周\${weekStr}更新\`; } 
+            if (item.status === 'Ended' && item.first_air_date && item.last_ep_date) { const start = item.first_air_date.slice(0,4); const end = item.last_ep_date.slice(0,4); return \`\${start} - \${end}\`; } 
+            if(item.release_date) return item.release_date; 
+            if(item.first_air_date) return \`首播: \${item.first_air_date}\`; 
+            return '未知日程'; 
+        };
+        const formatCapsuleRight = (item) => { 
+            if (item.air_time_iso) { 
+                const d = new Date(item.air_time_iso); 
+                const m = (d.getMonth()+1).toString().padStart(2,'0');
+                const day = d.getDate().toString().padStart(2,'0');
+                return \`\${m}/\${day}\`;
+            } 
+            if (item.next_ep_date) { const d = new Date(item.next_ep_date); const m = (d.getMonth()+1).toString().padStart(2, '0'); const day = d.getDate().toString().padStart(2, '0'); return \`\${m}/\${day} 更新\`; } 
+            if (item.status === 'Returning Series' && item.last_ep_date) { const d = new Date(item.last_ep_date); const m = (d.getMonth()+1).toString().padStart(2, '0'); const day = d.getDate().toString().padStart(2, '0'); return \`\${m}/\${day} 更新\`; } 
+            if(item.status === 'Ended') return '已完结'; 
+            if(item.release_date) return item.release_date.slice(0,4); 
+            return '待定'; 
+        };
         const formatVotes = (num) => { if(!num) return '0'; if(num > 1000) return (num/1000).toFixed(1) + 'k'; return num; };
         const getPoster = (i) => i.poster_path ? TMDB_IMG + 'w200' + i.poster_path : 'https://via.placeholder.com/200x300/e0e0e0/ffffff?text=No+Poster';
         const getBackdrop = (i) => { if (i.episode_image) return TMDB_IMG + 'w780' + i.episode_image; if (i.backdrop_path) return TMDB_IMG + 'w780' + i.backdrop_path; return 'https://via.placeholder.com/600x340/e0e0e0/ffffff?text=TMDB&Trakt追新'; };
