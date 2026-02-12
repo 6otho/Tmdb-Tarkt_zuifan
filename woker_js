@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (V11: 追新混合版 - 个人+公共日历合并)
+ * Cloudflare Worker 追番列表 (V17: 进度条统一 + 字体优化 + 详情页配色修复)
  * ==============================================================================
  */
 
@@ -39,17 +39,16 @@ export default {
                     return await handleUserAction(request, cleanEnv);
                 }
 
-                // ⚡️ GET 获取数据 - [我的] 页面接口
-                if (path.includes('/user/continue')) return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/playback', 20));
+                // ⚡️ GET 获取数据
+                if (path.includes('/user/continue')) return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/playback', 40)); 
                 if (path.includes('/user/watchlist')) return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/watchlist'));
                 if (path.includes('/user/myschedule')) return handleSmartCache(env, ctx, 'my_schedule', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14));
-                if (path.includes('/user/history')) return handleSmartCache(env, ctx, 'history', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/history', 20));
+                if (path.includes('/user/history')) return handleSmartCache(env, ctx, 'history', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/history', 50)); 
                 if (path.includes('/user/favs')) return handleSmartCache(env, ctx, 'favs', TTL_SHORT, () => handleUserFavs(cleanEnv));
                 
-                // ⚡️ 列表请求 (这里修改了 schedule 的逻辑)
+                // ⚡️ 列表请求
                 if (path.includes('/list')) {
                     const tab = url.searchParams.get('tab') || 'schedule';
-                    // schedule 缓存时间稍微缩短，因为包含了你的个人数据，需要较快更新
                     const ttl = tab === 'schedule' ? TTL_SHORT : TTL_LONG; 
                     return handleSmartCache(env, ctx, `list_${tab}`, ttl, () => handleListRequest(cleanEnv, url.searchParams));
                 }
@@ -68,7 +67,7 @@ export default {
             await env.KV.delete('history');   
             await env.KV.delete('my_schedule');
             await env.KV.delete('continue_watching');
-            await env.KV.delete('list_schedule'); // 清理混合日历缓存
+            await env.KV.delete('list_schedule');
             return new Response("Cache Flushed", {status: 200});
         }
 
@@ -101,10 +100,8 @@ async function handleUserAction(request, env) {
     const res = await fetch(`https://api.trakt.tv/${endpoint}`, { method: 'POST', headers, body: JSON.stringify(payload) });
     const data = await res.json();
     
-    // 操作成功后清理缓存
     if (res.ok) {
         if (action.includes('chase')) await env.KV.delete('watchlist');
-        // 标记已看或修改追番，都会影响日程，所以要清理 list_schedule
         await env.KV.delete('list_schedule'); 
         await env.KV.delete('my_schedule');
         if (action.includes('history')) {
@@ -178,18 +175,26 @@ async function handleTraktRequest(env, path, limit) {
     
     const hydrated = await hydrateTrakt(env, data, typeOverride);
     
-    if (path.includes('history')) {
-        const seen = new Set();
-        return new Response(JSON.stringify(hydrated.filter(i => !seen.has(i.id) && seen.add(i.id))), { headers: {'Content-Type': 'application/json'} });
+    // 强去重逻辑
+    if (path.includes('history') || path.includes('playback')) {
+        const seenShows = new Set();
+        const uniqueList = [];
+        for (const item of hydrated) {
+            const uniqueKey = `${item.media_type}_${item.id}`;
+            if (!seenShows.has(uniqueKey)) {
+                seenShows.add(uniqueKey);
+                uniqueList.push(item);
+            }
+        }
+        return new Response(JSON.stringify(uniqueList), { headers: {'Content-Type': 'application/json'} });
     }
+
     return new Response(JSON.stringify(hydrated), { headers: {'Content-Type': 'application/json'} });
 }
 
-// --- 核心：混合列表逻辑 (合并 个人追番 + 公共新番) ---
+// --- 列表逻辑 ---
 async function handleListRequest(env, params) {
     const tab = params.get('tab') || 'schedule';
-    
-    // 如果是“追新时刻表”，我们需要 Auth Token 来获取你的个人日历
     const token = (tab === 'schedule') ? await getValidAccessToken(env) : null;
     
     const headers = { 
@@ -202,39 +207,29 @@ async function handleListRequest(env, params) {
     if (tab === 'schedule') {
         const today = new Date().toISOString().split('T')[0];
         const days = 7;
-        
-        // 1. 获取你的个人日历 (美剧、日剧、动画...) - 这样你看了什么，这里就同步什么
         const myCalPromise = fetch(`https://api.trakt.tv/calendars/my/shows/${today}/${days}`, { headers });
-        
-        // 2. 获取公共新番日历 (用于发现) - 保持原有逻辑
         const pubCalPromise = fetch(`https://api.trakt.tv/calendars/all/shows/${today}/${days}?extended=full`, { headers });
         
         const [myRes, pubRes] = await Promise.all([myCalPromise, pubCalPromise]);
-        
         let myData = [];
         let pubData = [];
         
         if (myRes.ok) myData = await myRes.json();
         if (pubRes.ok) pubData = await pubRes.json();
 
-        // 筛选公共日历里的日本动画
         const pubAnime = pubData.filter(i => (i.show?.country === 'jp') && (i.show?.genres?.includes('anime') || i.show?.genres?.includes('animation')));
         
-        // 3. 合并与去重 (优先保留你的个人记录)
         const seenIds = new Set();
         const mergedList = [];
 
-        // 先加你的 (包含美剧、韩剧、动画等所有)
         for (const item of myData) {
             const id = item.show?.ids?.trakt;
             if (id && !seenIds.has(id)) {
                 seenIds.add(id);
-                // 标记一下这是你正在追的 (可选)
                 mergedList.push({ ...item, is_mine: true });
             }
         }
 
-        // 再加公共新番 (你没追的那些)
         for (const item of pubAnime) {
             const id = item.show?.ids?.trakt;
             if (id && !seenIds.has(id)) {
@@ -242,7 +237,6 @@ async function handleListRequest(env, params) {
                 mergedList.push(item);
             }
         }
-
         results = await hydrateTrakt(env, mergedList, 'schedule');
 
     } else if (tab === 'trakt_hot') {
@@ -257,8 +251,7 @@ async function handleListRequest(env, params) {
 
 // --- TMDB 补充信息 ---
 async function hydrateTrakt(env, items, typeOverride) {
-    // 限制一下并发，防止混合列表过大导致 TMDB 超时
-    const limitedItems = items.slice(0, 35); // 取前35个，避免 Worker 超时
+    const limitedItems = items.slice(0, 35); 
 
     const promises = limitedItems.map(async (item) => {
         let tmdbId, mediaType, airTime;
@@ -292,12 +285,23 @@ async function hydrateTrakt(env, items, typeOverride) {
             }
 
             return { 
-                ...d, media_type: mediaType, trakt_type: typeOverride, air_time_iso: airTime, episode_info: item.episode, 
+                ...d, 
+                media_type: mediaType, 
+                trakt_type: typeOverride, 
+                air_time_iso: airTime, 
+                episode_info: item.episode, 
+                origin_country: d.origin_country || [],
+                genres: d.genres || [],
                 runtime_real: d.runtime || (d.episode_run_time ? d.episode_run_time[0] : null),
-                episode_image: episodeStill, next_ep_date: d.next_episode_to_air ? d.next_episode_to_air.air_date : null,
-                last_ep_date: d.last_air_date, total_seasons: d.number_of_seasons, total_episodes: d.number_of_episodes, status: d.status,
+                episode_image: episodeStill, 
+                next_ep_date: d.next_episode_to_air ? d.next_episode_to_air.air_date : null,
+                last_ep_date: d.last_air_date, 
+                last_ep_info: d.last_episode_to_air,
+                total_seasons: d.number_of_seasons, 
+                total_episodes: d.number_of_episodes, 
+                status: d.status,
                 watch_progress: currentProgress,
-                is_tracking: item.is_mine || false // 标记是否在追
+                is_tracking: item.is_mine || false 
             }; 
         } catch { return null; }
     });
@@ -312,7 +316,7 @@ async function handleUserFavs(env) {
     return new Response(JSON.stringify(detailedList), { headers: {'Content-Type': 'application/json'} });
 }
 
-// ================= 🎨 前端 Vue UI (V11: 追新时刻表) =================
+// ================= 🎨 前端 Vue UI (V17: 统一胶囊 + 字体微调) =================
 const htmlContent = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -327,76 +331,144 @@ const htmlContent = `
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg-app: #F2F4F6; --bg-desktop: #202020; --accent-purple: #6D28D9; 
-    --glass-header: rgba(242, 244, 246, 0.75); --glass-nav: rgba(255, 255, 255, 0.75);
-    --glass-border: rgba(255, 255, 255, 0.4); --tmdb-color: #0d253f; --trakt-color: #ed1c24;
+    --bg-app: linear-gradient(135deg, #f0f2f5 0%, #d9e2ec 100%);
+    --bg-desktop: #e0e5ec;
+    --text-primary: #111111;
+    --text-secondary: #555555;
+    --text-tertiary: #666666;
+    --card-bg: #ffffff;
+    --card-shadow: 0 8px 20px -6px rgba(0, 0, 0, 0.08);
+    --glass-header: rgba(240, 242, 245, 0.85);
+    --glass-nav: rgba(255, 255, 255, 0.75);
+    --glass-border: rgba(255, 255, 255, 0.5);
+    --accent-purple: #6D28D9;
+    --pill-bg: rgba(255, 255, 255, 0.6);
+    --pill-active-text: #fff;
+    --capsule-bg: rgba(0, 0, 0, 0.06);
+    --capsule-left-bg: #000;
+    --capsule-left-text: #fff;
+    --capsule-right-text: #000;
+    --btn-bg: #111;
+    --btn-text: #fff;
+    --mask-gradient: linear-gradient(90deg, #EAECEF 28%, rgba(234,236,239,0.92) 55%, rgba(255,255,255,0.2) 100%);
+    
+    /* 🔥 V17: 亮色模式详情文字 -> 纯黑 */
+    --overview-text: #222; 
   }
-  html, body { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: 'Roboto', sans-serif; background-color: var(--bg-app); -webkit-tap-highlight-color: transparent; overscroll-behavior: none; position: fixed; left: 0; top: 0; right: 0; bottom: 0; }
-  #app-container { width: 100%; height: 100%; position: relative; background-color: var(--bg-app); display: flex; flex-direction: column; overflow: hidden; }
-  @media (min-width: 768px) { body { background-color: var(--bg-desktop); display: flex; justify-content: center; align-items: center; position: static; } #app-container { width: 100%; max-width: 430px; height: 90vh; max-height: 880px; position: relative; border-radius: 44px; border: 8px solid #2a2a2a; box-shadow: 0 0 60px rgba(0,0,0,0.6); overflow: hidden; } }
-  .top-glass-bar { position: absolute; top: 0; left: 0; right: 0; z-index: 20; background: var(--glass-header); backdrop-filter: blur(20px) saturate(180%); -webkit-backdrop-filter: blur(20px) saturate(180%); border-bottom: 1px solid rgba(0,0,0,0.05); padding-top: env(safe-area-inset-top); padding-bottom: 10px; }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg-app: linear-gradient(135deg, #121212 0%, #1e1e24 100%);
+      --bg-desktop: #000000;
+      --text-primary: #f5f5f5;
+      --text-secondary: #a0a0a0;
+      --text-tertiary: #888888;
+      --card-bg: #1e1e1e;
+      --card-shadow: 0 8px 20px -6px rgba(0, 0, 0, 0.4);
+      --glass-header: rgba(18, 18, 18, 0.85);
+      --glass-nav: rgba(30, 30, 30, 0.75);
+      --glass-border: rgba(255, 255, 255, 0.1);
+      --accent-purple: #8b5cf6;
+      --pill-bg: rgba(255, 255, 255, 0.1);
+      --pill-active-text: #fff;
+      --capsule-bg: rgba(255, 255, 255, 0.1);
+      --capsule-left-bg: #f5f5f5;
+      --capsule-left-text: #000;
+      --capsule-right-text: #ddd;
+      --btn-bg: #fff;
+      --btn-text: #000;
+      
+      --mask-gradient: linear-gradient(90deg, #1e1e1e 28%, rgba(30,30,30,0.92) 55%, rgba(30,30,30,0.2) 100%);
+      
+      /* 🔥 V17: 暗色模式详情文字 -> 纯白 */
+      --overview-text: #fff;
+    }
+  }
+
+  html, body { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: 'Roboto', sans-serif; background: var(--bg-app); -webkit-tap-highlight-color: transparent; overscroll-behavior: none; position: fixed; left: 0; top: 0; right: 0; bottom: 0; color: var(--text-primary); transition: background 0.3s ease; }
+  #app-container { width: 100%; height: 100%; position: relative; display: flex; flex-direction: column; overflow: hidden; }
+  @media (min-width: 768px) { body { background-color: var(--bg-desktop); display: flex; justify-content: center; align-items: center; position: static; } #app-container { width: 100%; max-width: 430px; height: 90vh; max-height: 880px; position: relative; border-radius: 44px; border: 8px solid #2a2a2a; box-shadow: 0 0 60px rgba(0,0,0,0.6); overflow: hidden; background: var(--bg-app); } }
+  
+  .top-glass-bar { position: absolute; top: 0; left: 0; right: 0; z-index: 20; background: var(--glass-header); backdrop-filter: blur(20px) saturate(180%); -webkit-backdrop-filter: blur(20px) saturate(180%); border-bottom: 1px solid var(--glass-border); padding-top: env(safe-area-inset-top); padding-bottom: 10px; }
   .header-nav { display: flex; justify-content: space-between; align-items: center; padding: 8px 20px 4px 20px; }
-  .media-segment { display: flex; align-items: center; background: rgba(220, 220, 220, 0.5); backdrop-filter: blur(10px); border-radius: 99px; padding: 3px; border: 1px solid rgba(255,255,255,0.4); }
-  .seg-btn { border-radius: 99px; padding: 6px 14px; display: flex; align-items: center; justify-content: center; gap: 6px; color: #555; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); font-size: 13px; cursor: pointer; overflow: hidden; white-space: nowrap; font-weight: 600; }
-  .seg-btn.active { background: #6D28D9; color: #fff; box-shadow: 0 2px 8px rgba(109, 40, 217, 0.3); }
+  .media-segment { display: flex; align-items: center; background: var(--pill-bg); backdrop-filter: blur(10px); border-radius: 99px; padding: 3px; border: 1px solid var(--glass-border); }
+  .seg-btn { border-radius: 99px; padding: 6px 14px; display: flex; align-items: center; justify-content: center; gap: 6px; color: var(--text-secondary); transition: all 0.3s; font-size: 13px; cursor: pointer; font-weight: 600; }
+  .seg-btn.active { background: var(--accent-purple); color: var(--pill-active-text); box-shadow: 0 2px 8px rgba(109, 40, 217, 0.3); }
   .page-header { padding: 0 20px; }
-  .page-title { font-size: 26px; font-weight: 900; color: #111; margin-bottom: 8px; letter-spacing: -0.5px; }
-  .sub-tabs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; } .sub-tabs::-webkit-scrollbar { display: none; }
-  .sub-pill { padding: 7px 14px; border-radius: 12px; font-size: 12px; font-weight: 700; background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.5); color: #4B5563; white-space: nowrap; transition: all 0.2s; flex-shrink: 0; }
-  .sub-pill.active { background: #fff; color: #000; border-color: #fff; transform: scale(1.03); box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
-  .week-grid-tabs { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; padding-bottom: 4px; }
-  .week-pill { padding: 7px 0; font-size: 12px; width: 100%; min-width: 0; text-align: center; background: rgba(255,255,255,0.5); border-radius: 10px; font-weight: 700; color: #555; transition: all 0.2s; }
-  .week-pill.active { background: #6D28D9; color: #fff; box-shadow: 0 3px 8px rgba(109, 40, 217, 0.3); }
+  .page-title { font-size: 26px; font-weight: 900; color: var(--text-primary); margin-bottom: 8px; letter-spacing: -0.5px; }
+  .sub-tabs { display: flex; gap: 8px; overflow-x: auto; padding: 0 20px 8px 20px; } .sub-tabs::-webkit-scrollbar { display: none; }
+  .sub-pill { padding: 7px 14px; border-radius: 12px; font-size: 12px; font-weight: 700; background: var(--pill-bg); border: 1px solid var(--glass-border); color: var(--text-secondary); white-space: nowrap; transition: all 0.2s; flex-shrink: 0; }
+  .sub-pill.active { background: var(--text-primary); color: var(--bg-app); border-color: var(--text-primary); transform: scale(1.03); opacity: 0.95; color: var(--card-bg) !important; }
+  .week-grid-tabs { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; padding: 0 20px 4px 20px; }
+  .week-pill { padding: 7px 0; font-size: 12px; width: 100%; min-width: 0; text-align: center; background: var(--pill-bg); border-radius: 10px; font-weight: 700; color: var(--text-secondary); transition: all 0.2s; }
+  .week-pill.active { background: var(--accent-purple); color: var(--pill-active-text); box-shadow: 0 3px 8px rgba(109, 40, 217, 0.3); }
+  
   .scroll-content { position: absolute; inset: 0; overflow-y: auto; padding: 0 16px; padding-top: calc(env(safe-area-inset-top) + 145px); padding-bottom: calc(env(safe-area-inset-bottom) + 80px); -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; z-index: 1; }
-  .scroll-content::-webkit-scrollbar { display: none; } .list-container { display: flex; flex-direction: column; gap: 14px; }
-  .rich-card { position: relative; width: 100%; height: 135px; border-radius: 22px; overflow: hidden; background: #fff; box-shadow: 0 8px 20px -6px rgba(0, 0, 0, 0.08); display: flex; align-items: center; flex-shrink: 0; transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1); cursor: pointer; }
+  .scroll-content::-webkit-scrollbar { display: none; } 
+  .list-container { display: flex; flex-direction: column; gap: 14px; }
+  .rich-card { position: relative; width: 100%; height: 135px; border-radius: 22px; overflow: hidden; background: var(--card-bg); box-shadow: var(--card-shadow); display: flex; align-items: center; flex-shrink: 0; transition: transform 0.2s; cursor: pointer; }
   .rich-card:active { transform: scale(0.97); }
   .card-bg { position: absolute; inset: 0; background-size: cover; background-position: center; opacity: 0.85; z-index: 0; filter: saturate(1.1); }
-  .card-mask { position: absolute; inset: 0; background: linear-gradient(90deg, #EAECEF 28%, rgba(234,236,239,0.92) 55%, rgba(255,255,255,0.2) 100%); z-index: 1; }
+  .card-mask { position: absolute; inset: 0; background: var(--mask-gradient); z-index: 1; }
   .card-body { position: relative; z-index: 2; width: 100%; height: 100%; display: flex; align-items: center; padding-left: 14px; }
-  .poster-thumb { width: 76px; height: 112px; border-radius: 12px; object-fit: cover; box-shadow: 0 5px 10px rgba(0,0,0,0.15); flex-shrink: 0; margin-right: 12px; background: #e0e0e0; }
+  
+  .poster-wrapper { position: relative; width: 76px; height: 112px; margin-right: 12px; flex-shrink: 0; }
+  .poster-thumb { width: 100%; height: 100%; border-radius: 12px; object-fit: cover; box-shadow: 0 5px 10px rgba(0,0,0,0.15); background: #333; }
+  .date-badge { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.65); backdrop-filter: blur(4px); color: #fff; font-size: 10px; font-weight: 700; text-align: center; padding: 3px 0; border-radius: 0 0 12px 12px; z-index: 10; letter-spacing: 0.5px; }
+
   .info-col { flex: 1; height: 112px; display: flex; flex-direction: column; padding-top: 4px; position: relative; min-width: 0; }
-  .title-txt { font-size: 16px; font-weight: 900; color: #111; margin-bottom: 2px; line-height: 1.2; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; letter-spacing: -0.3px; }
-  .subtitle-txt { font-size: 12px; color: #555; font-weight: 600; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 4px; }
-  .status-txt { font-size: 11px; color: #666; font-weight: 600; margin-bottom: auto; display: flex; align-items: center; gap: 4px; }
-  .capsule-bar { margin-bottom: 5px; width: 88%; height: 24px; background: rgba(0, 0, 0, 0.08); border-radius: 99px; display: flex; align-items: center; position: relative; backdrop-filter: blur(10px); padding: 2px; border: 1px solid rgba(255,255,255,0.2); }
-  .capsule-left { background: #000; color: #fff; padding: 0 10px; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; border-radius: 99px; white-space: nowrap; z-index: 2; box-shadow: 2px 0 6px rgba(0,0,0,0.1); }
-  .capsule-right { flex: 1; text-align: right; padding-right: 10px; color: #000; font-size: 10px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.8; }
+  .title-txt { font-size: 16px; font-weight: 900; color: var(--text-primary); margin-bottom: 2px; line-height: 1.2; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; letter-spacing: -0.3px; }
+  .subtitle-txt { font-size: 12px; color: var(--text-secondary); font-weight: 600; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 4px; }
+  .status-txt { font-size: 11px; color: var(--text-tertiary); font-weight: 600; margin-bottom: auto; display: flex; align-items: center; gap: 4px; }
+  
+  /* 🔥 V17: 统一的胶囊样式 (删除了 trakt-pill 类) */
+  .capsule-bar { margin-bottom: 5px; width: 88%; height: 24px; background: var(--capsule-bg); border-radius: 99px; display: flex; align-items: center; position: relative; backdrop-filter: blur(10px); padding: 2px; border: 1px solid var(--glass-border); }
+  .capsule-left { background: var(--capsule-left-bg); color: var(--capsule-left-text); padding: 0 10px; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; border-radius: 99px; white-space: nowrap; z-index: 2; box-shadow: 2px 0 6px rgba(0,0,0,0.1); }
+  /* 🔥 V17: 进度条右侧文字，默认 10px */
+  .capsule-right { flex: 1; text-align: right; padding-right: 10px; color: var(--capsule-right-text); font-size: 10px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.9; }
+
   .check-mark { position: absolute; bottom: 7px; right: 10px; color: var(--accent-purple); font-size: 15px; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1)); z-index: 5; }
+  
   .bottom-nav { position: absolute; left: 50%; transform: translateX(-50%); width: 92%; max-width: 380px; height: 56px; background: var(--glass-nav); backdrop-filter: blur(25px) saturate(180%); -webkit-backdrop-filter: blur(25px) saturate(180%); border-radius: 99px; border: 1px solid var(--glass-border); box-shadow: 0 10px 25px rgba(0,0,0,0.12); display: flex; justify-content: space-evenly; align-items: center; z-index: 50; bottom: calc(8px + env(safe-area-inset-bottom)); }
-  .nav-btn { display: flex; flex-direction: column; align-items: center; justify-content: center; color: #999; font-size: 9px; gap: 2px; width: 60px; height: 100%; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); }
-  .nav-btn i { font-size: 20px; transition: transform 0.3s; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.05)); } 
-  .nav-btn.active { color: #000; } .nav-btn.active i { transform: translateY(-2px) scale(1.1); color: #6D28D9; filter: drop-shadow(0 3px 6px rgba(109, 40, 217, 0.25)); }
+  .nav-btn { display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--nav-icon-inactive); font-size: 9px; gap: 2px; width: 60px; height: 100%; transition: all 0.3s; }
+  .nav-btn i { font-size: 24px; transition: transform 0.3s; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.05)); } 
+  .nav-btn.active { color: var(--nav-icon-active); } .nav-btn.active i { transform: translateY(-2px) scale(1.1); color: var(--accent-purple); filter: drop-shadow(0 3px 6px rgba(109, 40, 217, 0.25)); }
+  .nav-btn.active .user-avatar { border-color: var(--accent-purple); transform: translateY(-2px) scale(1.05); }
   .user-avatar { width: 24px; height: 24px; border-radius: 50%; background: #ccc; border: 2px solid transparent; transition: all 0.3s; box-shadow: 0 2px 5px rgba(0,0,0,0.15); }
-  .nav-btn.active .user-avatar { border-color: #6D28D9; transform: translateY(-2px) scale(1.05); }
-  .modal-overlay { position: absolute; inset: 0; z-index: 100; background: rgba(0,0,0,0.3); backdrop-filter: blur(6px); display: flex; align-items: flex-end; transition: opacity 0.3s; }
+
+  .modal-overlay { position: absolute; inset: 0; z-index: 100; background: rgba(0,0,0,0.5); backdrop-filter: blur(6px); display: flex; align-items: flex-end; transition: opacity 0.3s; }
   @media (max-width: 1024px) { .modal-overlay { position: fixed; bottom: 0; left: 0; right: 0; top: 0; } }
-  .detail-sheet { width: 100%; max-height: 85%; background: #fff; border-radius: 32px 32px 0 0; padding-bottom: calc(30px + env(safe-area-inset-bottom)); box-shadow: 0 -10px 50px rgba(0,0,0,0.25); display: flex; flex-direction: column; overflow: hidden; animation: slideUp 0.4s cubic-bezier(0.19, 1, 0.22, 1); }
+  .detail-sheet { width: 100%; max-height: 85%; background: var(--sheet-bg); border-radius: 32px 32px 0 0; padding-bottom: calc(30px + env(safe-area-inset-bottom)); box-shadow: 0 -10px 50px rgba(0,0,0,0.35); display: flex; flex-direction: column; overflow: hidden; animation: slideUp 0.4s cubic-bezier(0.19, 1, 0.22, 1); }
   @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
   .sheet-header { height: 240px; position: relative; flex-shrink: 0; }
   .sheet-backdrop { width: 100%; height: 100%; object-fit: cover; mask-image: linear-gradient(to bottom, black 60%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%); }
   .sheet-close { position: absolute; top: 16px; right: 16px; width: 34px; height: 34px; border-radius: 50%; background: rgba(0,0,0,0.5); color: #fff; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(15px); cursor: pointer; border: 1px solid rgba(255,255,255,0.2); }
   .sheet-body { padding: 0 24px 20px 24px; overflow-y: auto; margin-top: -40px; position: relative; z-index: 2; }
-  .sheet-title { font-size: 28px; font-weight: 900; line-height: 1.1; margin-bottom: 16px; color: #111; letter-spacing: -0.5px; text-shadow: 0 20px 40px #fff; }
+  .sheet-title { font-size: 28px; font-weight: 900; line-height: 1.1; margin-bottom: 16px; color: var(--text-primary); letter-spacing: -0.5px; text-shadow: 0 20px 40px var(--sheet-bg); }
   .rating-row { display: flex; gap: 12px; margin-bottom: 16px; align-items: center; }
   .rating-badge { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 12px; font-size: 13px; font-weight: 800; }
-  .rating-badge.tmdb { background: rgba(13, 37, 63, 0.08); color: var(--tmdb-color); }
-  .rating-badge.trakt { background: rgba(237, 28, 36, 0.08); color: var(--trakt-color); }
+  .rating-badge.tmdb { background: rgba(13, 37, 63, 0.15); color: #0d253f; }
+  .rating-badge.trakt { background: rgba(237, 28, 36, 0.15); color: #ed1c24; }
+  @media (prefers-color-scheme: dark) {
+     .rating-badge.tmdb { background: rgba(13, 37, 63, 0.6); color: #90cea1; } 
+     .rating-badge.trakt { background: rgba(237, 28, 36, 0.4); color: #ff9999; }
+  }
   .platform-logo { height: 14px; width: auto; }
   .genre-row { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 20px; padding-bottom: 4px; } .genre-row::-webkit-scrollbar { display: none; }
-  .genre-pill { flex-shrink: 0; padding: 4px 10px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.1); color: #666; font-size: 11px; font-weight: 600; background: #fff; }
-  .sheet-info-grid { display: flex; gap: 15px; margin-bottom: 20px; font-size: 13px; color: #555; font-weight: 600; }
+  .genre-pill { flex-shrink: 0; padding: 4px 10px; border-radius: 8px; border: 1px solid var(--glass-border); color: var(--text-secondary); font-size: 11px; font-weight: 600; background: var(--pill-bg); }
+  .sheet-info-grid { display: flex; gap: 15px; margin-bottom: 20px; font-size: 13px; color: var(--text-secondary); font-weight: 600; }
   .info-item { display: flex; align-items: center; gap: 5px; }
-  .sheet-overview { font-size: 16px; line-height: 1.6; color: #333; margin-bottom: 30px; font-weight: 400; opacity: 0.9; }
-  .sheet-btn { width: 100%; padding: 16px; border-radius: 18px; background: #111; color: #fff; font-weight: 800; font-size: 17px; display: flex; justify-content: center; align-items: center; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.25); transition: transform 0.2s; } .sheet-btn:active { transform: scale(0.98); }
-  .loading-box { display: flex; justify-content: center; padding-top: 200px; color: #888; }
   
-  .action-menu-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.4); z-index: 200; display: flex; flex-direction: column; justify-content: flex-end; animation: fadeIn 0.2s; }
-  .action-sheet { background: #fff; border-radius: 24px 24px 0 0; padding: 20px; padding-bottom: calc(20px + env(safe-area-inset-bottom)); animation: slideUp 0.3s cubic-bezier(0.2, 0.8, 0.2, 1); }
-  .action-btn { display: flex; align-items: center; gap: 12px; padding: 16px; font-size: 16px; font-weight: 600; color: #333; border-bottom: 1px solid #f0f0f0; }
+  .sheet-overview { font-size: 16px; line-height: 1.7; color: var(--overview-text); margin-bottom: 30px; font-weight: 400; opacity: 1; }
+  
+  .sheet-btn { width: 100%; padding: 16px; border-radius: 18px; background: var(--btn-bg); color: var(--btn-text); font-weight: 800; font-size: 17px; display: flex; justify-content: center; align-items: center; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.25); transition: transform 0.2s; } .sheet-btn:active { transform: scale(0.98); }
+  .loading-box { display: flex; justify-content: center; padding-top: 200px; color: var(--text-tertiary); }
+  
+  .action-menu-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; display: flex; flex-direction: column; justify-content: flex-end; animation: fadeIn 0.2s; }
+  .action-sheet { background: var(--action-sheet-bg); border-radius: 24px 24px 0 0; padding: 20px; padding-bottom: calc(20px + env(safe-area-inset-bottom)); animation: slideUp 0.3s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .action-btn { display: flex; align-items: center; gap: 12px; padding: 16px; font-size: 16px; font-weight: 600; color: var(--text-primary); border-bottom: 1px solid var(--glass-border); }
   .action-btn:last-child { border-bottom: none; }
-  .action-btn:active { background: #f5f5f5; border-radius: 12px; }
-  .action-btn.danger { color: #ef4444; }
+  .action-btn:active { background: var(--pill-bg); border-radius: 12px; }
   .action-btn i { width: 24px; text-align: center; font-size: 18px; }
   
   .toast-box { position: absolute; top: 110px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.85); color: #fff; padding: 10px 20px; border-radius: 50px; font-size: 13px; font-weight: 600; z-index: 300; display: flex; align-items: center; gap: 8px; backdrop-filter: blur(10px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); animation: toastPop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
@@ -435,16 +507,25 @@ const htmlContent = `
                 <div class="card-bg" :style="{ backgroundImage: 'url(' + getBackdrop(item) + ')' }"></div>
                 <div class="card-mask"></div>
                 <div class="card-body">
-                    <img :src="getPoster(item)" class="poster-thumb" loading="lazy">
+                    <div class="poster-wrapper">
+                         <img :src="getPoster(item)" class="poster-thumb" loading="lazy">
+                         <div v-if="currentMainTab === 'schedule'" class="date-badge">{{ getRelativeDateLabel(item) }}</div>
+                    </div>
                     <div class="info-col">
                         <div class="more-btn-area" @click.stop="openMenu(item)"><i class="fas fa-ellipsis-h"></i></div>
                         <div class="title-txt">{{ item.name || item.title }}</div>
                         <div class="subtitle-txt">{{ formatSubtitle(item) }}</div>
                         <div class="status-txt"><i class="far fa-calendar-check"></i> {{ formatScheduleInfo(item) }}</div>
+                        
+                        <!-- 🔥 V17: 统一使用 capsule-bar，内部根据内容判断 -->
                         <div class="capsule-bar">
                             <div class="capsule-left">{{ formatDuration(item) }}</div>
-                            <div class="capsule-right">{{ formatCapsuleRight(item) }}</div>
+                            <!-- 🔥 字体强制 9px，防止挤压 -->
+                            <div class="capsule-right" style="font-size:9px">
+                                {{ currentSubTab === 'continue' ? formatTraktStats(item) : formatCapsuleRight(item) }}
+                            </div>
                         </div>
+                        
                         <div class="check-mark"><i class="fas fa-check-circle"></i></div>
                     </div>
                 </div>
@@ -468,7 +549,7 @@ const htmlContent = `
                 <h2 class="sheet-title">{{ selectedItem.name || selectedItem.title }}</h2>
                 <div class="rating-row">
                     <div class="rating-badge tmdb"><img src="https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg" class="platform-logo"><span class="score-val">{{ selectedItem.vote_average?.toFixed(1) || '0.0' }}</span></div>
-                    <div class="rating-badge trakt" v-if="selectedItem.vote_count"><img src="https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg" class="platform-logo"><span class="score-val" style="color:#333">{{ formatVotes(selectedItem.vote_count) }}</span></div>
+                    <div class="rating-badge trakt" v-if="selectedItem.vote_count"><img src="https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg" class="platform-logo"><span class="score-val" style="color:var(--text-primary)">{{ formatVotes(selectedItem.vote_count) }}</span></div>
                 </div>
                 <div class="genre-row" v-if="selectedItem.genres && selectedItem.genres.length"><span v-for="g in selectedItem.genres" :key="g.id" class="genre-pill">{{ g.name }}</span></div>
                 <div class="sheet-info-grid">
@@ -483,7 +564,7 @@ const htmlContent = `
 
     <div v-if="menuItem" class="action-menu-overlay" @click.self="menuItem = null">
         <div class="action-sheet">
-            <div style="font-size:18px; font-weight:800; margin-bottom:15px; padding:0 10px; color:#111;">{{ menuItem.name || menuItem.title }}</div>
+            <div style="font-size:18px; font-weight:800; margin-bottom:15px; padding:0 10px; color:var(--text-primary);">{{ menuItem.name || menuItem.title }}</div>
             
             <div class="action-btn" @click="performAction('add_chase', menuItem)">
                 <i class="fas fa-heart text-red-500"></i> 加入追番 (Tracking)
@@ -494,7 +575,7 @@ const htmlContent = `
             <div class="action-btn" @click="performAction('add_history', menuItem)">
                 <i class="fas fa-check-circle text-green-500"></i> 标记为已看 (Watched)
             </div>
-            <div class="action-btn" @click="menuItem = null" style="justify-content:center; color:#666; font-weight:500; margin-top:10px; border:none;">关闭</div>
+            <div class="action-btn" @click="menuItem = null" style="justify-content:center; color:var(--text-tertiary); font-weight:500; margin-top:10px; border:none;">关闭</div>
         </div>
     </div>
 </div>
@@ -526,7 +607,6 @@ createApp({
             else return [ { key: 'trakt_hot', name: '热门趋势' }, { key: 'hot', name: '本周热榜' } ];
         });
         
-        // ⚡️ V11: 标题已改为“追新时刻表”
         const getPageTitle = () => { 
             if(currentMainTab.value === 'schedule') return '追新时刻表'; 
             const map = { 
@@ -546,7 +626,6 @@ createApp({
             if (filterType.value === 'tv') list = list.filter(i => i.media_type === 'tv');
             if (filterType.value === 'movie') list = list.filter(i => i.media_type === 'movie');
             
-            // ⚡️ V11: 混合列表同样支持周一到周日筛选
             if (currentMainTab.value === 'schedule') {
                 return list.filter(i => { 
                     const dateStr = i.air_time_iso || i.first_air_date; 
@@ -585,7 +664,6 @@ createApp({
                 if(!res.ok) throw new Error("失败");
                 const map = { 'add_chase': '❤️ 已加入追番', 'remove_chase': '💔 已取消追番', 'add_history': '🎉 标记为已看' };
                 showToast(map[action] || '操作成功');
-                // 刷新数据，因为“追新时刻表”依赖你的个人追番数据
                 setTimeout(fetchData, 800);
             } catch(e) { showToast("❌ 操作失败"); }
         };
@@ -606,7 +684,38 @@ createApp({
             if (item.total_episodes) return \`共 \${item.total_episodes} 集\`; 
             return item.original_name || item.title || 'Movie'; 
         };
-        const formatDuration = (item) => { let t = item.runtime_real || (item.episode_run_time ? item.episode_run_time[0] : 0) || 24; return \`\${t}分钟\`; };
+        
+        const formatDuration = (item) => { 
+            let t = item.runtime_real;
+            if (!t) {
+                if (item.media_type === 'tv') {
+                     const isAnime = (item.origin_country && item.origin_country.includes('JP')) || 
+                                     (item.genres && item.genres.some(g => g.name === 'Animation' || g.name === '动画'));
+                     t = isAnime ? 24 : 45;
+                }
+            }
+            if (!t || t === 0) return '未知';
+            return \`\${t}分钟\`; 
+        };
+        
+        const formatTraktStats = (item) => {
+             if (item.media_type === 'movie') return 'Movie';
+             let total = item.total_episodes || 0;
+             let current = item.episode_info ? item.episode_info.number : 0;
+             let remaining = Math.max(0, total - current);
+             if (item.status === 'Ended' && remaining <= 0) return '已完结';
+             let runtimeStr = formatDuration(item);
+             let runtime = parseInt(runtimeStr) || 24;
+             let minsLeft = remaining * runtime;
+             let timeStr = '';
+             if (minsLeft > 60) {
+                 timeStr = \`\${Math.floor(minsLeft/60)}小时 \${minsLeft%60}分\`;
+             } else {
+                 timeStr = \`\${minsLeft}分钟\`;
+             }
+             return \`剩余\${remaining}集 · \${timeStr}\`;
+        };
+
         const formatScheduleInfo = (item) => { 
             if (item.watch_progress) return \`已看 \${item.watch_progress}%\`;
             if (item.status === 'Returning Series' && item.next_ep_date) { const day = new Date(item.next_ep_date).getDay(); const weekStr = ['日','一','二','三','四','五','六'][day]; return \`每周\${weekStr}更新\`; } 
@@ -615,26 +724,51 @@ createApp({
             if(item.first_air_date) return \`首播: \${item.first_air_date}\`; 
             return '未知日程'; 
         };
+        
         const formatCapsuleRight = (item) => { 
-            if (item.air_time_iso) { 
-                const d = new Date(item.air_time_iso); 
-                const m = (d.getMonth()+1).toString().padStart(2,'0');
-                const day = d.getDate().toString().padStart(2,'0');
-                return \`\${m}/\${day}\`;
-            } 
-            if (item.next_ep_date) { const d = new Date(item.next_ep_date); const m = (d.getMonth()+1).toString().padStart(2, '0'); const day = d.getDate().toString().padStart(2, '0'); return \`\${m}/\${day} 更新\`; } 
-            if (item.status === 'Returning Series' && item.last_ep_date) { const d = new Date(item.last_ep_date); const m = (d.getMonth()+1).toString().padStart(2, '0'); const day = d.getDate().toString().padStart(2, '0'); return \`\${m}/\${day} 更新\`; } 
-            if(item.status === 'Ended') return '已完结'; 
-            if(item.release_date) return item.release_date.slice(0,4); 
-            return '待定'; 
+            if (item.media_type === 'movie') {
+                return item.release_date ? item.release_date.split('-')[0] : '电影';
+            }
+            const total = item.total_episodes || 0;
+            const lastEp = item.last_ep_info;
+            const current = lastEp ? lastEp.episode_number : 0;
+
+            if (total > 0) {
+                if (item.status === 'Ended' || item.status === 'Canceled') return \`\${total}集全\`;
+                if (current > 0) return \`\${current}/\${total}集\`;
+                return \`共\${total}集\`;
+            }
+            if (item.status === 'Returning Series') return '更新中';
+            if (item.status === 'Ended') return '已完结';
+            return 'TV Series'; 
         };
+
+        const getRelativeDateLabel = (item) => {
+            const dateStr = item.air_time_iso || item.first_air_date;
+            if (!dateStr) return '';
+            const targetDate = new Date(dateStr);
+            const today = new Date();
+            today.setHours(0,0,0,0);
+            const targetCheck = new Date(targetDate);
+            targetCheck.setHours(0,0,0,0);
+            const diffTime = targetCheck - today;
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+            
+            if (diffDays === 0) return '今天';
+            if (diffDays === 1) return '明天';
+            if (diffDays === 2) return '后天';
+            const weekStr = ['周日','周一','周二','周三','周四','周五','周六'][targetDate.getDay()];
+            if (Math.abs(diffDays) > 7) return \`\${targetDate.getMonth()+1}/\${targetDate.getDate()}\`;
+            return weekStr;
+        };
+
         const formatVotes = (num) => { if(!num) return '0'; if(num > 1000) return (num/1000).toFixed(1) + 'k'; return num; };
         const getPoster = (i) => i.poster_path ? TMDB_IMG + 'w200' + i.poster_path : 'https://via.placeholder.com/200x300/e0e0e0/ffffff?text=No+Poster';
-        const getBackdrop = (i) => { if (i.episode_image) return TMDB_IMG + 'w780' + i.episode_image; if (i.backdrop_path) return TMDB_IMG + 'w780' + i.backdrop_path; return 'https://via.placeholder.com/600x340/e0e0e0/ffffff?text=TMDB&Trakt追新'; };
+        const getBackdrop = (i) => { if (i.episode_image) return TMDB_IMG + 'w780' + i.episode_image; if (i.backdrop_path) return TMDB_IMG + 'w780' + i.backdrop_path; return 'https://via.placeholder.com/600x340/e0e0e0/ffffff?text=TMDB&Trakt'; };
         const openModal = (item) => { selectedItem.value = item; };
         const openMenu = (item) => { menuItem.value = item; }; 
         onMounted(() => fetchData());
-        return { currentMainTab, switchMainTab, currentSubTab, subTabs, filterType, weekDays, selectedWeekDay, loading, processedList, getPageTitle, selectedItem, menuItem, toastMsg, openModal, openMenu, performAction, getPoster, getBackdrop, formatSubtitle, formatDuration, formatScheduleInfo, formatCapsuleRight, formatVotes };
+        return { currentMainTab, switchMainTab, currentSubTab, subTabs, filterType, weekDays, selectedWeekDay, loading, processedList, getPageTitle, selectedItem, menuItem, toastMsg, openModal, openMenu, performAction, getPoster, getBackdrop, formatSubtitle, formatDuration, formatScheduleInfo, formatCapsuleRight, formatTraktStats, getRelativeDateLabel, formatVotes };
     }
 }).mount('#app-container');
 </script>
