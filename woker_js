@@ -1,17 +1,16 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (V21: 完美修复版 - 收藏/继续观看数据修复 + 菜单增强)
+ * Cloudflare Worker 追番列表 (V22: 终极修复版 - 双向收藏合并 + 强制数据刷新)
  * ==============================================================================
  */
 
 const TTL_LONG = 3600;
-const TTL_SHORT = 60;
+const TTL_SHORT = 30; // 缩短缓存时间以防数据不同步
 
-// 通用请求头
 const REFLIX_HEADERS = {
     'Content-Type': 'application/json',
     'trakt-api-version': '2',
-    'User-Agent': 'Reflix/2.1.0 (iPad; iOS 16.1; Scale/2.00)',
+    'User-Agent': 'Reflix/2.2.0 (iPad; iOS 16.1; Scale/2.00)',
     'Accept': '*/*'
 };
 
@@ -30,50 +29,60 @@ export default {
                 TMDB_TOKEN: env.TMDB_TOKEN?.trim()
             };
 
-            // 检查环境变量
             if (!cleanEnv.KV || !cleanEnv.TRAKT_ID || !cleanEnv.TRAKT_SECRET || !cleanEnv.TRAKT_INIT_REFRESH) {
                 return new Response(JSON.stringify({ error: "Config Error: Check Variables" }), { status: 500 });
             }
 
             try {
-                // ⚡️ POST 交互 (收藏/追番/历史)
+                // ⚡️ POST 交互
                 if (request.method === 'POST' && path === '/api/action') {
                     return await handleUserAction(request, cleanEnv);
                 }
 
                 // ⚡️ GET 获取数据
-                // 继续观看 (Limit 50)
+                
+                // 1. 继续观看 (Trakt Playback) - 修正：同时获取电影和剧集
                 if (path.includes('/user/continue')) {
-                    return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/playback/episodes', 50, 'continue'));
+                    return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, 
+                        () => handleTraktRequest(cleanEnv, 'sync/playback', 50, 'continue')); 
                 }
-                // 我的追番 (Watchlist)
+
+                // 2. 我的追番 (Trakt Watchlist)
                 if (path.includes('/user/watchlist')) {
-                    return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/watchlist', 100, 'chase'));
+                    return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, 
+                        () => handleTraktRequest(cleanEnv, 'sync/watchlist', 100, 'chase'));
                 }
-                // 即将播出 (Schedule)
+
+                // 3. 即将播出 (Trakt Calendar)
                 if (path.includes('/user/myschedule')) {
-                    return handleSmartCache(env, ctx, 'my_schedule', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14, 'myschedule'));
-                }
-                // Trakt 收藏 (Collection) - 替代历史记录
-                if (path.includes('/user/trakt_fav')) {
-                    return handleSmartCache(env, ctx, 'trakt_fav', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/collection/shows', 50, 'trakt_fav'));
-                }
-                // TMDB 收藏
-                if (path.includes('/user/favs')) {
-                    return handleSmartCache(env, ctx, 'favs', TTL_SHORT, () => handleUserFavs(cleanEnv));
+                    return handleSmartCache(env, ctx, 'my_schedule', TTL_SHORT, 
+                        () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14, 'myschedule'));
                 }
                 
-                // ⚡️ 公共列表请求 (Discovery)
+                // 4. 🔥 核心修复：Trakt 收藏 (Collection) - 混合 电影+电视剧
+                if (path.includes('/user/trakt_fav')) {
+                    return handleSmartCache(env, ctx, 'trakt_fav', TTL_SHORT, 
+                        () => handleMixedCollection(cleanEnv)); 
+                }
+                
+                // 5. TMDB 收藏
+                if (path.includes('/user/favs')) {
+                    return handleSmartCache(env, ctx, 'favs', TTL_SHORT, 
+                        () => handleUserFavs(cleanEnv));
+                }
+                
+                // ⚡️ 公共列表请求
                 if (path.includes('/list')) {
                     const tab = url.searchParams.get('tab') || 'schedule';
                     const ttl = tab === 'schedule' ? TTL_SHORT : TTL_LONG; 
-                    return handleSmartCache(env, ctx, `list_${tab}`, ttl, () => handleListRequest(cleanEnv, url.searchParams));
+                    return handleSmartCache(env, ctx, `list_${tab}`, ttl, 
+                        () => handleListRequest(cleanEnv, url.searchParams));
                 }
 
                 return new Response(JSON.stringify({ error: "Endpoint Not Found" }), { status: 404 });
 
             } catch (e) {
-                return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+                return new Response(JSON.stringify({ error: e.message, stack: e.stack }), { status: 500 });
             }
         }
 
@@ -102,17 +111,19 @@ async function handleUserAction(request, env) {
     let endpoint = '';
     let payload = {};
     
+    // 构建 Trakt Payload
     const mediaObject = { ids: { tmdb: item.id } };
     if (item.media_type === 'movie') payload = { movies: [mediaObject] };
     else payload = { shows: [mediaObject] };
 
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
 
+    // 动作映射
     if (action === 'add_chase') endpoint = 'sync/watchlist';         
     else if (action === 'remove_chase') endpoint = 'sync/watchlist/remove'; 
     else if (action === 'add_history') endpoint = 'sync/history';    
-    else if (action === 'add_fav') endpoint = 'sync/collection';         // 新增：加入收藏
-    else if (action === 'remove_fav') endpoint = 'sync/collection/remove'; // 新增：取消收藏
+    else if (action === 'add_fav') endpoint = 'sync/collection';         // 收藏
+    else if (action === 'remove_fav') endpoint = 'sync/collection/remove'; // 取消收藏
 
     if (!endpoint) return new Response(JSON.stringify({error: "Unknown Action"}), {status: 400});
 
@@ -120,15 +131,10 @@ async function handleUserAction(request, env) {
     const data = await res.json();
     
     if (res.ok) {
-        // 暴力清除相关缓存，确保数据刷新
-        if (action.includes('chase')) await env.KV.delete('watchlist');
-        if (action.includes('fav')) await env.KV.delete('trakt_fav');
-        
-        await env.KV.delete('list_schedule'); 
-        await env.KV.delete('my_schedule');
-        
-        if (action.includes('history')) {
-            await env.KV.delete('continue_watching');
+        // 🔥 暴力清除所有相关缓存，保证数据即时刷新
+        const keysToDelete = ['watchlist', 'trakt_fav', 'list_schedule', 'my_schedule', 'continue_watching'];
+        for (const key of keysToDelete) {
+            await env.KV.delete(key);
         }
     }
 
@@ -140,6 +146,7 @@ async function getValidAccessToken(env) {
     let authData = await env.KV.get('TRAKT_AUTH', { type: 'json' });
     if (!authData) return await refreshTraktToken(env, env.TRAKT_INIT_REFRESH);
     const now = Math.floor(Date.now() / 1000);
+    // 提前10分钟刷新
     if (now > (authData.created_at + authData.expires_in - 600)) return await refreshTraktToken(env, authData.refresh_token);
     return authData.access_token;
 }
@@ -152,8 +159,8 @@ async function refreshTraktToken(env, refreshToken) {
     });
     const textData = await res.text();
     let data;
-    try { data = JSON.parse(textData); } catch (e) { throw new Error(`Trakt Auth Error: ${textData.substring(0,50)}`); }
-    if (!res.ok) throw new Error(`Auth Failed: ${data.error_description}`);
+    try { data = JSON.parse(textData); } catch (e) { throw new Error(`Trakt Auth JSON Error: ${textData.substring(0,50)}`); }
+    if (!res.ok) throw new Error(`Trakt Auth Failed: ${data.error_description || res.status}`);
     await env.KV.put('TRAKT_AUTH', JSON.stringify(data));
     return data.access_token;
 }
@@ -162,62 +169,91 @@ async function refreshTraktToken(env, refreshToken) {
 async function handleSmartCache(env, ctx, key, ttl, fetcher) {
     if (!env.KV) return fetcher();
     const cached = await env.KV.get(key);
-    // 简单的有效性检查
     if (cached && !cached.trim().startsWith('<') && cached.length > 5) return new Response(cached, { headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' } });
-    if (cached && cached.trim().startsWith('<')) await env.KV.delete(key);
     
     const res = await fetcher();
     if (res.status === 200) {
         const data = await res.clone().text();
-        if (data.trim().startsWith('{') || data.trim().startsWith('[')) ctx.waitUntil(env.KV.put(key, data, { expirationTtl: ttl }));
+        // 只有合法的 JSON 才缓存
+        if (data.trim().startsWith('{') || data.trim().startsWith('[')) {
+            ctx.waitUntil(env.KV.put(key, data, { expirationTtl: ttl }));
+        }
     }
     return res;
 }
 
-// --- Trakt 核心请求处理 (修复逻辑) ---
-async function handleTraktRequest(env, path, limit, typeOverride) {
+// --- 🔥 修复：混合获取收藏 (电影 + 剧集) ---
+async function handleMixedCollection(env) {
     const token = await getValidAccessToken(env);
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
     
+    // 并行请求 Shows 和 Movies 的收藏
+    const [resShows, resMovies] = await Promise.all([
+        fetch('https://api.trakt.tv/sync/collection/shows?extended=metadata', { headers }),
+        fetch('https://api.trakt.tv/sync/collection/movies?extended=metadata', { headers })
+    ]);
+
+    let shows = [], movies = [];
+    if (resShows.ok) shows = await resShows.json();
+    if (resMovies.ok) movies = await resMovies.json();
+
+    // 合并
+    let allItems = [...shows, ...movies];
+
+    // 排序：按最后收藏时间倒序 (last_collected_at)
+    allItems.sort((a, b) => {
+        const dateA = new Date(a.last_collected_at || a.collected_at || 0);
+        const dateB = new Date(b.last_collected_at || b.collected_at || 0);
+        return dateB - dateA;
+    });
+
+    // 截取前 50 条，防止请求过多
+    const slicedItems = allItems.slice(0, 50);
+
+    // 补充 TMDB 数据
+    const hydrated = await hydrateTrakt(env, slicedItems, 'trakt_fav');
+    
+    return new Response(JSON.stringify(hydrated), { 
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Debug-Raw-Count': allItems.length.toString()
+        } 
+    });
+}
+
+// --- 通用 Trakt 请求处理 ---
+async function handleTraktRequest(env, path, limit, typeOverride) {
+    const token = await getValidAccessToken(env);
+    const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
     let url = `https://api.trakt.tv/${path}`;
     
     // URL 参数处理
     if (path.includes('watchlist')) url += `?sort=added,desc`; 
     else if (path.includes('playback')) url += `?limit=${limit}`; 
     else if (path.includes('calendars')) url = `${url}/${new Date().toISOString().split('T')[0]}/${limit}`;
-    else if (path.includes('collection')) url += `?extended=metadata`; // Collection 加上元数据
 
     const res = await fetch(url, { headers });
-    if (!res.ok) throw new Error(`Trakt API Error: ${res.status}`);
+    if (!res.ok) throw new Error(`API Error ${res.status}: ${path}`);
     
     let rawData = await res.json();
     if (!Array.isArray(rawData)) rawData = [];
 
-    // 🔥 1. 数据预处理（排序与去重）
-    
-    // 如果是 Collection (收藏)，Trakt 默认不按时间排序，手动按 last_collected_at 倒序
-    if (typeOverride === 'trakt_fav') {
-        rawData.sort((a, b) => new Date(b.last_collected_at || 0) - new Date(a.last_collected_at || 0));
-        rawData = rawData.slice(0, limit); // 手动截取
-    }
-
-    // 如果是 Playback (继续观看)，去重 show ID，只保留最近观看的一集
+    // 去重逻辑 (针对 Playback 这种可能出现重复 show 记录的接口)
     if (typeOverride === 'continue') {
         const seen = new Set();
         const unique = [];
         for (const item of rawData) {
-            const showId = item.show?.ids?.trakt || item.movie?.ids?.trakt;
-            if (showId && !seen.has(showId)) {
-                seen.add(showId);
+            // 无论是电影还是剧集，尝试获取 Trakt ID
+            const id = item.show?.ids?.trakt || item.movie?.ids?.trakt || item.id;
+            if (id && !seen.has(id)) {
+                seen.add(id);
                 unique.push(item);
             }
         }
         rawData = unique;
     }
 
-    // 🔥 2. Hydrate (注入 TMDB 数据)
     const hydrated = await hydrateTrakt(env, rawData, typeOverride);
-
     return new Response(JSON.stringify(hydrated), { headers: {'Content-Type': 'application/json'} });
 }
 
@@ -236,23 +272,20 @@ async function handleListRequest(env, params) {
     if (tab === 'schedule') {
         const today = new Date().toISOString().split('T')[0];
         const days = 7;
-        const myCalPromise = fetch(`https://api.trakt.tv/calendars/my/shows/${today}/${days}`, { headers });
-        const pubCalPromise = fetch(`https://api.trakt.tv/calendars/all/shows/${today}/${days}?extended=full`, { headers });
+        const [myRes, pubRes] = await Promise.all([
+            fetch(`https://api.trakt.tv/calendars/my/shows/${today}/${days}`, { headers }),
+            fetch(`https://api.trakt.tv/calendars/all/shows/${today}/${days}?extended=full`, { headers })
+        ]);
         
-        const [myRes, pubRes] = await Promise.all([myCalPromise, pubCalPromise]);
-        let myData = [];
-        let pubData = [];
-        
-        if (myRes.ok) myData = await myRes.json();
-        if (pubRes.ok) pubData = await pubRes.json();
+        let myData = myRes.ok ? await myRes.json() : [];
+        let pubData = pubRes.ok ? await pubRes.json() : [];
 
-        // 过滤日漫
+        // 筛选公共日历中的日漫
         const pubAnime = pubData.filter(i => (i.show?.country === 'jp') && (i.show?.genres?.includes('anime') || i.show?.genres?.includes('animation')));
         
         const seenIds = new Set();
         const mergedList = [];
 
-        // 优先显示我的日历
         for (const item of myData) {
             const id = item.show?.ids?.trakt;
             if (id && !seenIds.has(id)) {
@@ -261,7 +294,6 @@ async function handleListRequest(env, params) {
             }
         }
 
-        // 补充热门日漫
         for (const item of pubAnime) {
             const id = item.show?.ids?.trakt;
             if (id && !seenIds.has(id)) {
@@ -281,21 +313,24 @@ async function handleListRequest(env, params) {
     return new Response(JSON.stringify(results), { headers: {'Content-Type': 'application/json'} });
 }
 
-// --- TMDB 补充信息 (核心函数) ---
+// --- 🔥 核心：TMDB 补充信息 (Hydration) ---
 async function hydrateTrakt(env, items, typeOverride) {
-    // 防止过多请求
+    // 安全检查
+    if (!Array.isArray(items)) return [];
+    
     const limitedItems = items.slice(0, 35); 
 
     const promises = limitedItems.map(async (item) => {
         let tmdbId, mediaType, airTime;
         
-        // 提取时间
+        // 1. 智能提取时间戳
         if (item.first_aired) airTime = item.first_aired;
-        if (item.paused_at) airTime = item.paused_at; // Continue Watching
-        if (item.last_collected_at) airTime = item.last_collected_at; // Collection
-        if (item.collected_at) airTime = item.collected_at;
+        else if (item.paused_at) airTime = item.paused_at; 
+        else if (item.last_collected_at) airTime = item.last_collected_at;
+        else if (item.collected_at) airTime = item.collected_at;
+        else if (item.listed_at) airTime = item.listed_at;
         
-        // 提取 ID 和 类型
+        // 2. 智能提取 ID 和类型
         if (item.show) { tmdbId = item.show.ids.tmdb; mediaType = 'tv'; }
         else if (item.movie) { tmdbId = item.movie.ids.tmdb; mediaType = 'movie'; }
         else { tmdbId = item.id; mediaType = item.media_type || 'tv'; }
@@ -303,14 +338,15 @@ async function hydrateTrakt(env, items, typeOverride) {
         if (!tmdbId) return null;
 
         try {
+            // TMDB 请求
             const r = await fetch(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
-            if (!r.ok) return null;
+            if (!r.ok) return null; // 如果 TMDB 没这剧，跳过
             const d = await r.json();
             
             let episodeStill = null;
             let currentProgress = null;
 
-            // 如果是剧集且有具体集数信息（如 Schedule 或 Playback）
+            // 如果有具体集数 (Schedule/Playback)
             if (mediaType === 'tv' && item.episode) {
                 try {
                     const epRes = await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}/season/${item.episode.season}/episode/${item.episode.number}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
@@ -319,11 +355,11 @@ async function hydrateTrakt(env, items, typeOverride) {
                 } catch(err) {}
             }
             
-            // 提取播放进度
             if (typeOverride === 'continue' && item.progress) {
                 currentProgress = item.progress;
             }
 
+            // 返回标准结构
             return { 
                 ...d, 
                 media_type: mediaType, 
@@ -346,6 +382,7 @@ async function hydrateTrakt(env, items, typeOverride) {
         } catch { return null; }
     });
     
+    // 等待所有并行请求完成，并过滤失败的
     const resolved = await Promise.all(promises);
     return resolved.filter(i => i !== null);
 }
@@ -359,7 +396,7 @@ async function handleUserFavs(env) {
     return new Response(JSON.stringify(detailedList), { headers: {'Content-Type': 'application/json'} });
 }
 
-// ================= 🎨 前端 Vue UI (V21: 按钮逻辑修复 + 数据绑定) =================
+// ================= 🎨 前端 Vue UI =================
 const htmlContent = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -445,7 +482,6 @@ const htmlContent = `
   .week-pill { padding: 7px 0; font-size: 12px; width: 100%; min-width: 0; text-align: center; background: var(--pill-bg); border-radius: 10px; font-weight: 700; color: var(--text-secondary); transition: all 0.2s; }
   .week-pill.active { background: var(--accent-purple); color: var(--pill-active-text); box-shadow: 0 3px 8px rgba(109, 40, 217, 0.3); }
   
-  /* 列表容器下移，防止被头部遮挡 */
   .scroll-content { position: absolute; inset: 0; overflow-y: auto; padding: 0 16px; padding-top: calc(env(safe-area-inset-top) + 165px); padding-bottom: calc(env(safe-area-inset-bottom) + 80px); -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; z-index: 1; }
   .scroll-content::-webkit-scrollbar { display: none; } 
   .list-container { display: flex; flex-direction: column; gap: 14px; }
@@ -726,7 +762,8 @@ createApp({
                     'remove_fav': '🌧️ 已取消收藏'
                 };
                 showToast(map[action] || '操作成功');
-                setTimeout(fetchData, 800);
+                // 延迟刷新以等待后端缓存清理
+                setTimeout(fetchData, 1000);
             } catch(e) { showToast("❌ 操作失败"); }
         };
 
