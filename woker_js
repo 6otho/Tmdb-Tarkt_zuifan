@@ -1,16 +1,16 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (V22: 终极修复版 - 双向收藏合并 + 强制数据刷新)
+ * Cloudflare Worker 追番列表 (V24: 红心图标UI修复 + 数组强校验防止报错)
  * ==============================================================================
  */
 
 const TTL_LONG = 3600;
-const TTL_SHORT = 30; // 缩短缓存时间以防数据不同步
+const TTL_SHORT = 30; // 极短缓存，保证操作后立即刷新
 
 const REFLIX_HEADERS = {
     'Content-Type': 'application/json',
     'trakt-api-version': '2',
-    'User-Agent': 'Reflix/2.2.0 (iPad; iOS 16.1; Scale/2.00)',
+    'User-Agent': 'Reflix/2.4.0 (iPad; iOS 16.1; Scale/2.00)',
     'Accept': '*/*'
 };
 
@@ -41,28 +41,28 @@ export default {
 
                 // ⚡️ GET 获取数据
                 
-                // 1. 继续观看 (Trakt Playback) - 修正：同时获取电影和剧集
+                // 1. 继续观看 (Playback)
                 if (path.includes('/user/continue')) {
                     return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, 
                         () => handleTraktRequest(cleanEnv, 'sync/playback', 50, 'continue')); 
                 }
 
-                // 2. 我的追番 (Trakt Watchlist)
+                // 2. 我的追番 (Watchlist)
                 if (path.includes('/user/watchlist')) {
                     return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, 
                         () => handleTraktRequest(cleanEnv, 'sync/watchlist', 100, 'chase'));
                 }
 
-                // 3. 即将播出 (Trakt Calendar)
+                // 3. 即将播出 (Schedule)
                 if (path.includes('/user/myschedule')) {
                     return handleSmartCache(env, ctx, 'my_schedule', TTL_SHORT, 
                         () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14, 'myschedule'));
                 }
                 
-                // 4. 🔥 核心修复：Trakt 收藏 (Collection) - 混合 电影+电视剧
+                // 4. Trakt 喜爱列表 (Favorites) - 读取真正的红心列表
                 if (path.includes('/user/trakt_fav')) {
                     return handleSmartCache(env, ctx, 'trakt_fav', TTL_SHORT, 
-                        () => handleMixedCollection(cleanEnv)); 
+                        () => handleTrueFavorites(cleanEnv)); 
                 }
                 
                 // 5. TMDB 收藏
@@ -82,22 +82,17 @@ export default {
                 return new Response(JSON.stringify({ error: "Endpoint Not Found" }), { status: 404 });
 
             } catch (e) {
-                return new Response(JSON.stringify({ error: e.message, stack: e.stack }), { status: 500 });
+                return new Response(JSON.stringify({ error: e.message }), { status: 500 });
             }
         }
 
         // 🛡️ 2. 缓存清理
         if (path === '/flush') {
-            await env.KV.delete('TRAKT_AUTH');
-            await env.KV.delete('watchlist'); 
-            await env.KV.delete('trakt_fav');   
-            await env.KV.delete('my_schedule');
-            await env.KV.delete('continue_watching');
-            await env.KV.delete('list_schedule');
+            const keys = ['TRAKT_AUTH', 'watchlist', 'trakt_fav', 'my_schedule', 'continue_watching', 'list_schedule'];
+            for (const key of keys) await env.KV.delete(key);
             return new Response("Cache Flushed", {status: 200});
         }
 
-        // 3. 返回前端页面
         return new Response(htmlContent, { headers: { 'content-type': 'text/html;charset=UTF-8' } });
     },
 };
@@ -122,8 +117,9 @@ async function handleUserAction(request, env) {
     if (action === 'add_chase') endpoint = 'sync/watchlist';         
     else if (action === 'remove_chase') endpoint = 'sync/watchlist/remove'; 
     else if (action === 'add_history') endpoint = 'sync/history';    
-    else if (action === 'add_fav') endpoint = 'sync/collection';         // 收藏
-    else if (action === 'remove_fav') endpoint = 'sync/collection/remove'; // 取消收藏
+    // 注意：Trakt API 不支持 Write Favorites，所以这里用 Collection 代替，但前端显示为红心
+    else if (action === 'add_collection') endpoint = 'sync/collection';         
+    else if (action === 'remove_collection') endpoint = 'sync/collection/remove';
 
     if (!endpoint) return new Response(JSON.stringify({error: "Unknown Action"}), {status: 400});
 
@@ -131,11 +127,9 @@ async function handleUserAction(request, env) {
     const data = await res.json();
     
     if (res.ok) {
-        // 🔥 暴力清除所有相关缓存，保证数据即时刷新
-        const keysToDelete = ['watchlist', 'trakt_fav', 'list_schedule', 'my_schedule', 'continue_watching'];
-        for (const key of keysToDelete) {
-            await env.KV.delete(key);
-        }
+        // 暴力清除缓存
+        const keys = ['watchlist', 'trakt_fav', 'list_schedule', 'my_schedule', 'continue_watching'];
+        for (const key of keys) await env.KV.delete(key);
     }
 
     return new Response(JSON.stringify(data), { headers: {'Content-Type': 'application/json'} });
@@ -146,7 +140,6 @@ async function getValidAccessToken(env) {
     let authData = await env.KV.get('TRAKT_AUTH', { type: 'json' });
     if (!authData) return await refreshTraktToken(env, env.TRAKT_INIT_REFRESH);
     const now = Math.floor(Date.now() / 1000);
-    // 提前10分钟刷新
     if (now > (authData.created_at + authData.expires_in - 600)) return await refreshTraktToken(env, authData.refresh_token);
     return authData.access_token;
 }
@@ -159,8 +152,8 @@ async function refreshTraktToken(env, refreshToken) {
     });
     const textData = await res.text();
     let data;
-    try { data = JSON.parse(textData); } catch (e) { throw new Error(`Trakt Auth JSON Error: ${textData.substring(0,50)}`); }
-    if (!res.ok) throw new Error(`Trakt Auth Failed: ${data.error_description || res.status}`);
+    try { data = JSON.parse(textData); } catch (e) { throw new Error(`Trakt Auth Error`); }
+    if (!res.ok) throw new Error(`Auth Failed`);
     await env.KV.put('TRAKT_AUTH', JSON.stringify(data));
     return data.access_token;
 }
@@ -174,7 +167,6 @@ async function handleSmartCache(env, ctx, key, ttl, fetcher) {
     const res = await fetcher();
     if (res.status === 200) {
         const data = await res.clone().text();
-        // 只有合法的 JSON 才缓存
         if (data.trim().startsWith('{') || data.trim().startsWith('[')) {
             ctx.waitUntil(env.KV.put(key, data, { expirationTtl: ttl }));
         }
@@ -182,43 +174,47 @@ async function handleSmartCache(env, ctx, key, ttl, fetcher) {
     return res;
 }
 
-// --- 🔥 修复：混合获取收藏 (电影 + 剧集) ---
-async function handleMixedCollection(env) {
+// --- 🔥 修复：获取真正的 Favorites (Red Hearts) ---
+async function handleTrueFavorites(env) {
     const token = await getValidAccessToken(env);
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
     
-    // 并行请求 Shows 和 Movies 的收藏
+    // 分别请求 喜欢的剧集 和 喜欢的电影
     const [resShows, resMovies] = await Promise.all([
-        fetch('https://api.trakt.tv/sync/collection/shows?extended=metadata', { headers }),
-        fetch('https://api.trakt.tv/sync/collection/movies?extended=metadata', { headers })
+        fetch('https://api.trakt.tv/users/me/favorites/shows', { headers }),
+        fetch('https://api.trakt.tv/users/me/favorites/movies', { headers })
     ]);
 
-    let shows = [], movies = [];
-    if (resShows.ok) shows = await resShows.json();
-    if (resMovies.ok) movies = await resMovies.json();
+    let shows = [];
+    let movies = [];
 
-    // 合并
+    // 🔥 强校验：防止数据为空时解构报错
+    if (resShows.ok) {
+        const json = await resShows.json();
+        if (Array.isArray(json)) shows = json;
+    }
+    if (resMovies.ok) {
+        const json = await resMovies.json();
+        if (Array.isArray(json)) movies = json;
+    }
+
+    // 合并并按 liked_at 排序
     let allItems = [...shows, ...movies];
-
-    // 排序：按最后收藏时间倒序 (last_collected_at)
+    
+    // 排序逻辑 (liked_at 是 Favorites 接口特有的时间字段)
     allItems.sort((a, b) => {
-        const dateA = new Date(a.last_collected_at || a.collected_at || 0);
-        const dateB = new Date(b.last_collected_at || b.collected_at || 0);
-        return dateB - dateA;
+        const tA = new Date(a.liked_at || 0).getTime();
+        const tB = new Date(b.liked_at || 0).getTime();
+        return tB - tA;
     });
 
-    // 截取前 50 条，防止请求过多
+    // 截取前 50 条
     const slicedItems = allItems.slice(0, 50);
 
-    // 补充 TMDB 数据
+    // 补充 TMDB 数据 (typeOverride = 'fav')
     const hydrated = await hydrateTrakt(env, slicedItems, 'trakt_fav');
     
-    return new Response(JSON.stringify(hydrated), { 
-        headers: {
-            'Content-Type': 'application/json',
-            'X-Debug-Raw-Count': allItems.length.toString()
-        } 
-    });
+    return new Response(JSON.stringify(hydrated), { headers: { 'Content-Type': 'application/json' } });
 }
 
 // --- 通用 Trakt 请求处理 ---
@@ -227,23 +223,21 @@ async function handleTraktRequest(env, path, limit, typeOverride) {
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
     let url = `https://api.trakt.tv/${path}`;
     
-    // URL 参数处理
     if (path.includes('watchlist')) url += `?sort=added,desc`; 
     else if (path.includes('playback')) url += `?limit=${limit}`; 
     else if (path.includes('calendars')) url = `${url}/${new Date().toISOString().split('T')[0]}/${limit}`;
 
     const res = await fetch(url, { headers });
-    if (!res.ok) throw new Error(`API Error ${res.status}: ${path}`);
+    if (!res.ok) throw new Error(`API Error ${res.status}`);
     
     let rawData = await res.json();
     if (!Array.isArray(rawData)) rawData = [];
 
-    // 去重逻辑 (针对 Playback 这种可能出现重复 show 记录的接口)
+    // 去重 (Playback)
     if (typeOverride === 'continue') {
         const seen = new Set();
         const unique = [];
         for (const item of rawData) {
-            // 无论是电影还是剧集，尝试获取 Trakt ID
             const id = item.show?.ids?.trakt || item.movie?.ids?.trakt || item.id;
             if (id && !seen.has(id)) {
                 seen.add(id);
@@ -279,27 +273,17 @@ async function handleListRequest(env, params) {
         
         let myData = myRes.ok ? await myRes.json() : [];
         let pubData = pubRes.ok ? await pubRes.json() : [];
-
-        // 筛选公共日历中的日漫
         const pubAnime = pubData.filter(i => (i.show?.country === 'jp') && (i.show?.genres?.includes('anime') || i.show?.genres?.includes('animation')));
         
         const seenIds = new Set();
         const mergedList = [];
-
         for (const item of myData) {
             const id = item.show?.ids?.trakt;
-            if (id && !seenIds.has(id)) {
-                seenIds.add(id);
-                mergedList.push({ ...item, is_mine: true });
-            }
+            if (id && !seenIds.has(id)) { seenIds.add(id); mergedList.push({ ...item, is_mine: true }); }
         }
-
         for (const item of pubAnime) {
             const id = item.show?.ids?.trakt;
-            if (id && !seenIds.has(id)) {
-                seenIds.add(id);
-                mergedList.push(item);
-            }
+            if (id && !seenIds.has(id)) { seenIds.add(id); mergedList.push(item); }
         }
         results = await hydrateTrakt(env, mergedList, 'schedule');
 
@@ -313,24 +297,20 @@ async function handleListRequest(env, params) {
     return new Response(JSON.stringify(results), { headers: {'Content-Type': 'application/json'} });
 }
 
-// --- 🔥 核心：TMDB 补充信息 (Hydration) ---
+// --- TMDB 补充信息 ---
 async function hydrateTrakt(env, items, typeOverride) {
-    // 安全检查
     if (!Array.isArray(items)) return [];
-    
     const limitedItems = items.slice(0, 35); 
 
     const promises = limitedItems.map(async (item) => {
         let tmdbId, mediaType, airTime;
         
-        // 1. 智能提取时间戳
+        // 提取时间戳
         if (item.first_aired) airTime = item.first_aired;
         else if (item.paused_at) airTime = item.paused_at; 
-        else if (item.last_collected_at) airTime = item.last_collected_at;
+        else if (item.liked_at) airTime = item.liked_at; // Favorites time
         else if (item.collected_at) airTime = item.collected_at;
-        else if (item.listed_at) airTime = item.listed_at;
         
-        // 2. 智能提取 ID 和类型
         if (item.show) { tmdbId = item.show.ids.tmdb; mediaType = 'tv'; }
         else if (item.movie) { tmdbId = item.movie.ids.tmdb; mediaType = 'movie'; }
         else { tmdbId = item.id; mediaType = item.media_type || 'tv'; }
@@ -338,15 +318,13 @@ async function hydrateTrakt(env, items, typeOverride) {
         if (!tmdbId) return null;
 
         try {
-            // TMDB 请求
             const r = await fetch(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
-            if (!r.ok) return null; // 如果 TMDB 没这剧，跳过
+            if (!r.ok) return null;
             const d = await r.json();
             
             let episodeStill = null;
             let currentProgress = null;
 
-            // 如果有具体集数 (Schedule/Playback)
             if (mediaType === 'tv' && item.episode) {
                 try {
                     const epRes = await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}/season/${item.episode.season}/episode/${item.episode.number}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
@@ -354,12 +332,8 @@ async function hydrateTrakt(env, items, typeOverride) {
                     if(epData.still_path) episodeStill = epData.still_path;
                 } catch(err) {}
             }
-            
-            if (typeOverride === 'continue' && item.progress) {
-                currentProgress = item.progress;
-            }
+            if (typeOverride === 'continue' && item.progress) currentProgress = item.progress;
 
-            // 返回标准结构
             return { 
                 ...d, 
                 media_type: mediaType, 
@@ -382,7 +356,6 @@ async function hydrateTrakt(env, items, typeOverride) {
         } catch { return null; }
     });
     
-    // 等待所有并行请求完成，并过滤失败的
     const resolved = await Promise.all(promises);
     return resolved.filter(i => i !== null);
 }
@@ -396,7 +369,7 @@ async function handleUserFavs(env) {
     return new Response(JSON.stringify(detailedList), { headers: {'Content-Type': 'application/json'} });
 }
 
-// ================= 🎨 前端 Vue UI =================
+// ================= 🎨 前端 Vue UI (V24: 图标修复) =================
 const htmlContent = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -641,7 +614,7 @@ const htmlContent = `
                     <div class="info-item">{{ formatSubtitle(selectedItem) }}</div>
                 </div>
                 <p class="sheet-overview">{{ selectedItem.overview || '暂无简介...' }}</p>
-                <div class="sheet-btn" @click="performAction('add_chase', selectedItem)"><i class="fas fa-heart"></i> 加入我的追番</div>
+                <div class="sheet-btn" @click="performAction('add_chase', selectedItem)"><i class="fas fa-bookmark"></i> 加入我的追番</div>
             </div>
         </div>
     </div>
@@ -651,17 +624,17 @@ const htmlContent = `
             <div style="font-size:18px; font-weight:800; margin-bottom:15px; padding:0 10px; color:var(--text-primary);">{{ menuItem.name || menuItem.title }}</div>
             
             <div class="action-btn" @click="performAction('add_chase', menuItem)">
-                <i class="fas fa-heart text-red-500"></i> 加入追番 (Tracking)
+                <i class="fas fa-bookmark text-blue-500"></i> 加入追番 (Watchlist)
             </div>
             <div class="action-btn" @click="performAction('remove_chase', menuItem)">
                 <i class="fas fa-ban text-gray-500"></i> 取消追番 (Untrack)
             </div>
             
-            <div class="action-btn" @click="performAction('add_fav', menuItem)">
-                <i class="fas fa-star text-yellow-500"></i> 加入Trakt收藏 (Collection)
+            <div class="action-btn" @click="performAction('add_collection', menuItem)">
+                <i class="fas fa-heart text-red-500"></i> 加入Trakt收藏 (Collection)
             </div>
-             <div class="action-btn" @click="performAction('remove_fav', menuItem)">
-                <i class="fas fa-eraser text-purple-500"></i> 取消Trakt收藏
+             <div class="action-btn" @click="performAction('remove_collection', menuItem)">
+                <i class="far fa-heart text-gray-400"></i> 取消Trakt收藏
             </div>
             
             <div class="action-btn" @click="performAction('add_history', menuItem)">
@@ -693,7 +666,7 @@ createApp({
                 { key: 'continue', name: '继续观看' },
                 { key: 'chase',    name: '我的追番' },
                 { key: 'myschedule', name: '即将播出' },
-                { key: 'trakt_fav',  name: 'Trakt收藏' }
+                { key: 'trakt_fav',  name: 'Trakt红心' } // 修正名称
             ]; 
             else if (currentMainTab.value === 'schedule') return []; 
             else return [ { key: 'trakt_hot', name: '热门趋势' }, { key: 'hot', name: '本周热榜' } ];
@@ -705,7 +678,7 @@ createApp({
                 'continue': '继续观看',
                 'chase': '我的追番', 
                 'myschedule': '即将播出',
-                'trakt_fav': 'Trakt 收藏库',
+                'trakt_fav': 'Trakt 喜爱(Hearts)', // 修正标题
                 'fav_all': 'TMDB收藏',
                 'trakt_hot': 'Trakt 热门', 
                 'hot': 'TMDB 热榜' 
@@ -755,14 +728,13 @@ createApp({
                 });
                 if(!res.ok) throw new Error("失败");
                 const map = { 
-                    'add_chase': '❤️ 已加入追番', 
-                    'remove_chase': '💔 已取消追番', 
+                    'add_chase': '🔖 已加入追番', 
+                    'remove_chase': '🗑️ 已取消追番', 
                     'add_history': '🎉 标记为已看',
-                    'add_fav': '🌟 已加入收藏',   
-                    'remove_fav': '🌧️ 已取消收藏'
+                    'add_collection': '❤️ 已收藏(Collection)', 
+                    'remove_collection': '💔 已取消收藏'
                 };
                 showToast(map[action] || '操作成功');
-                // 延迟刷新以等待后端缓存清理
                 setTimeout(fetchData, 1000);
             } catch(e) { showToast("❌ 操作失败"); }
         };
