@@ -1,12 +1,13 @@
 /**
  * ==============================================================================
- * Cloudflare Worker 追番列表 (V17: 进度条统一 + 字体优化 + 详情页配色修复)
+ * Cloudflare Worker 追番列表 (V21: 完美修复版 - 收藏/继续观看数据修复 + 菜单增强)
  * ==============================================================================
  */
 
 const TTL_LONG = 3600;
 const TTL_SHORT = 60;
 
+// 通用请求头
 const REFLIX_HEADERS = {
     'Content-Type': 'application/json',
     'trakt-api-version': '2',
@@ -29,24 +30,40 @@ export default {
                 TMDB_TOKEN: env.TMDB_TOKEN?.trim()
             };
 
+            // 检查环境变量
             if (!cleanEnv.KV || !cleanEnv.TRAKT_ID || !cleanEnv.TRAKT_SECRET || !cleanEnv.TRAKT_INIT_REFRESH) {
                 return new Response(JSON.stringify({ error: "Config Error: Check Variables" }), { status: 500 });
             }
 
             try {
-                // ⚡️ POST 交互
+                // ⚡️ POST 交互 (收藏/追番/历史)
                 if (request.method === 'POST' && path === '/api/action') {
                     return await handleUserAction(request, cleanEnv);
                 }
 
                 // ⚡️ GET 获取数据
-                if (path.includes('/user/continue')) return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/playback', 40)); 
-                if (path.includes('/user/watchlist')) return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/watchlist'));
-                if (path.includes('/user/myschedule')) return handleSmartCache(env, ctx, 'my_schedule', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14));
-                if (path.includes('/user/history')) return handleSmartCache(env, ctx, 'history', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/history', 50)); 
-                if (path.includes('/user/favs')) return handleSmartCache(env, ctx, 'favs', TTL_SHORT, () => handleUserFavs(cleanEnv));
+                // 继续观看 (Limit 50)
+                if (path.includes('/user/continue')) {
+                    return handleSmartCache(env, ctx, 'continue_watching', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/playback/episodes', 50, 'continue'));
+                }
+                // 我的追番 (Watchlist)
+                if (path.includes('/user/watchlist')) {
+                    return handleSmartCache(env, ctx, 'watchlist', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/watchlist', 100, 'chase'));
+                }
+                // 即将播出 (Schedule)
+                if (path.includes('/user/myschedule')) {
+                    return handleSmartCache(env, ctx, 'my_schedule', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'calendars/my/shows', 14, 'myschedule'));
+                }
+                // Trakt 收藏 (Collection) - 替代历史记录
+                if (path.includes('/user/trakt_fav')) {
+                    return handleSmartCache(env, ctx, 'trakt_fav', TTL_SHORT, () => handleTraktRequest(cleanEnv, 'sync/collection/shows', 50, 'trakt_fav'));
+                }
+                // TMDB 收藏
+                if (path.includes('/user/favs')) {
+                    return handleSmartCache(env, ctx, 'favs', TTL_SHORT, () => handleUserFavs(cleanEnv));
+                }
                 
-                // ⚡️ 列表请求
+                // ⚡️ 公共列表请求 (Discovery)
                 if (path.includes('/list')) {
                     const tab = url.searchParams.get('tab') || 'schedule';
                     const ttl = tab === 'schedule' ? TTL_SHORT : TTL_LONG; 
@@ -64,7 +81,7 @@ export default {
         if (path === '/flush') {
             await env.KV.delete('TRAKT_AUTH');
             await env.KV.delete('watchlist'); 
-            await env.KV.delete('history');   
+            await env.KV.delete('trakt_fav');   
             await env.KV.delete('my_schedule');
             await env.KV.delete('continue_watching');
             await env.KV.delete('list_schedule');
@@ -94,6 +111,8 @@ async function handleUserAction(request, env) {
     if (action === 'add_chase') endpoint = 'sync/watchlist';         
     else if (action === 'remove_chase') endpoint = 'sync/watchlist/remove'; 
     else if (action === 'add_history') endpoint = 'sync/history';    
+    else if (action === 'add_fav') endpoint = 'sync/collection';         // 新增：加入收藏
+    else if (action === 'remove_fav') endpoint = 'sync/collection/remove'; // 新增：取消收藏
 
     if (!endpoint) return new Response(JSON.stringify({error: "Unknown Action"}), {status: 400});
 
@@ -101,11 +120,14 @@ async function handleUserAction(request, env) {
     const data = await res.json();
     
     if (res.ok) {
+        // 暴力清除相关缓存，确保数据刷新
         if (action.includes('chase')) await env.KV.delete('watchlist');
+        if (action.includes('fav')) await env.KV.delete('trakt_fav');
+        
         await env.KV.delete('list_schedule'); 
         await env.KV.delete('my_schedule');
+        
         if (action.includes('history')) {
-            await env.KV.delete('history');
             await env.KV.delete('continue_watching');
         }
     }
@@ -140,8 +162,10 @@ async function refreshTraktToken(env, refreshToken) {
 async function handleSmartCache(env, ctx, key, ttl, fetcher) {
     if (!env.KV) return fetcher();
     const cached = await env.KV.get(key);
+    // 简单的有效性检查
     if (cached && !cached.trim().startsWith('<') && cached.length > 5) return new Response(cached, { headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' } });
     if (cached && cached.trim().startsWith('<')) await env.KV.delete(key);
+    
     const res = await fetcher();
     if (res.status === 200) {
         const data = await res.clone().text();
@@ -150,44 +174,49 @@ async function handleSmartCache(env, ctx, key, ttl, fetcher) {
     return res;
 }
 
-// --- Trakt 请求处理 ---
-async function handleTraktRequest(env, path, limit) {
+// --- Trakt 核心请求处理 (修复逻辑) ---
+async function handleTraktRequest(env, path, limit, typeOverride) {
     const token = await getValidAccessToken(env);
     const headers = { ...REFLIX_HEADERS, 'trakt-api-key': env.TRAKT_ID, 'Authorization': `Bearer ${token}` };
+    
     let url = `https://api.trakt.tv/${path}`;
     
+    // URL 参数处理
     if (path.includes('watchlist')) url += `?sort=added,desc`; 
-    else if (path.includes('history')) url += `?limit=${limit}`;
     else if (path.includes('playback')) url += `?limit=${limit}`; 
     else if (path.includes('calendars')) url = `${url}/${new Date().toISOString().split('T')[0]}/${limit}`;
+    else if (path.includes('collection')) url += `?extended=metadata`; // Collection 加上元数据
 
     const res = await fetch(url, { headers });
-    const textData = await res.text();
-    let data;
-    try { data = JSON.parse(textData); } catch(e) { throw new Error("Trakt API Error"); }
-    if (!res.ok) throw new Error(`API Error: ${res.status}`);
+    if (!res.ok) throw new Error(`Trakt API Error: ${res.status}`);
     
-    let typeOverride = 'default';
-    if (path.includes('watchlist')) typeOverride = 'chase';
-    else if (path.includes('history')) typeOverride = 'history';
-    else if (path.includes('playback')) typeOverride = 'continue';
-    else if (path.includes('calendars')) typeOverride = 'myschedule';
+    let rawData = await res.json();
+    if (!Array.isArray(rawData)) rawData = [];
+
+    // 🔥 1. 数据预处理（排序与去重）
     
-    const hydrated = await hydrateTrakt(env, data, typeOverride);
-    
-    // 强去重逻辑
-    if (path.includes('history') || path.includes('playback')) {
-        const seenShows = new Set();
-        const uniqueList = [];
-        for (const item of hydrated) {
-            const uniqueKey = `${item.media_type}_${item.id}`;
-            if (!seenShows.has(uniqueKey)) {
-                seenShows.add(uniqueKey);
-                uniqueList.push(item);
+    // 如果是 Collection (收藏)，Trakt 默认不按时间排序，手动按 last_collected_at 倒序
+    if (typeOverride === 'trakt_fav') {
+        rawData.sort((a, b) => new Date(b.last_collected_at || 0) - new Date(a.last_collected_at || 0));
+        rawData = rawData.slice(0, limit); // 手动截取
+    }
+
+    // 如果是 Playback (继续观看)，去重 show ID，只保留最近观看的一集
+    if (typeOverride === 'continue') {
+        const seen = new Set();
+        const unique = [];
+        for (const item of rawData) {
+            const showId = item.show?.ids?.trakt || item.movie?.ids?.trakt;
+            if (showId && !seen.has(showId)) {
+                seen.add(showId);
+                unique.push(item);
             }
         }
-        return new Response(JSON.stringify(uniqueList), { headers: {'Content-Type': 'application/json'} });
+        rawData = unique;
     }
+
+    // 🔥 2. Hydrate (注入 TMDB 数据)
+    const hydrated = await hydrateTrakt(env, rawData, typeOverride);
 
     return new Response(JSON.stringify(hydrated), { headers: {'Content-Type': 'application/json'} });
 }
@@ -217,11 +246,13 @@ async function handleListRequest(env, params) {
         if (myRes.ok) myData = await myRes.json();
         if (pubRes.ok) pubData = await pubRes.json();
 
+        // 过滤日漫
         const pubAnime = pubData.filter(i => (i.show?.country === 'jp') && (i.show?.genres?.includes('anime') || i.show?.genres?.includes('animation')));
         
         const seenIds = new Set();
         const mergedList = [];
 
+        // 优先显示我的日历
         for (const item of myData) {
             const id = item.show?.ids?.trakt;
             if (id && !seenIds.has(id)) {
@@ -230,6 +261,7 @@ async function handleListRequest(env, params) {
             }
         }
 
+        // 补充热门日漫
         for (const item of pubAnime) {
             const id = item.show?.ids?.trakt;
             if (id && !seenIds.has(id)) {
@@ -240,7 +272,7 @@ async function handleListRequest(env, params) {
         results = await hydrateTrakt(env, mergedList, 'schedule');
 
     } else if (tab === 'trakt_hot') {
-        const res = await fetch('https://api.trakt.tv/shows/trending?limit=10', { headers });
+        const res = await fetch('https://api.trakt.tv/shows/trending?limit=15', { headers });
         results = await hydrateTrakt(env, await res.json(), 'trending');
     } else {
         const r = await fetch(`https://api.themoviedb.org/3/trending/all/week?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
@@ -249,16 +281,21 @@ async function handleListRequest(env, params) {
     return new Response(JSON.stringify(results), { headers: {'Content-Type': 'application/json'} });
 }
 
-// --- TMDB 补充信息 ---
+// --- TMDB 补充信息 (核心函数) ---
 async function hydrateTrakt(env, items, typeOverride) {
+    // 防止过多请求
     const limitedItems = items.slice(0, 35); 
 
     const promises = limitedItems.map(async (item) => {
         let tmdbId, mediaType, airTime;
-        if (item.first_aired) airTime = item.first_aired;
-        if (item.watched_at) airTime = item.watched_at;
-        if (item.paused_at) airTime = item.paused_at;
         
+        // 提取时间
+        if (item.first_aired) airTime = item.first_aired;
+        if (item.paused_at) airTime = item.paused_at; // Continue Watching
+        if (item.last_collected_at) airTime = item.last_collected_at; // Collection
+        if (item.collected_at) airTime = item.collected_at;
+        
+        // 提取 ID 和 类型
         if (item.show) { tmdbId = item.show.ids.tmdb; mediaType = 'tv'; }
         else if (item.movie) { tmdbId = item.movie.ids.tmdb; mediaType = 'movie'; }
         else { tmdbId = item.id; mediaType = item.media_type || 'tv'; }
@@ -267,11 +304,13 @@ async function hydrateTrakt(env, items, typeOverride) {
 
         try {
             const r = await fetch(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
+            if (!r.ok) return null;
             const d = await r.json();
             
             let episodeStill = null;
             let currentProgress = null;
 
+            // 如果是剧集且有具体集数信息（如 Schedule 或 Playback）
             if (mediaType === 'tv' && item.episode) {
                 try {
                     const epRes = await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}/season/${item.episode.season}/episode/${item.episode.number}?language=zh-CN`, { headers: { 'Authorization': `Bearer ${env.TMDB_TOKEN}` } });
@@ -280,6 +319,7 @@ async function hydrateTrakt(env, items, typeOverride) {
                 } catch(err) {}
             }
             
+            // 提取播放进度
             if (typeOverride === 'continue' && item.progress) {
                 currentProgress = item.progress;
             }
@@ -305,9 +345,12 @@ async function hydrateTrakt(env, items, typeOverride) {
             }; 
         } catch { return null; }
     });
-    return (await Promise.all(promises)).filter(i => i !== null);
+    
+    const resolved = await Promise.all(promises);
+    return resolved.filter(i => i !== null);
 }
 
+// TMDB 原生收藏
 async function handleUserFavs(env) {
     const headers = { 'Authorization': `Bearer ${env.TMDB_TOKEN}` };
     const acc = await (await fetch('https://api.themoviedb.org/3/account', { headers })).json();
@@ -316,7 +359,7 @@ async function handleUserFavs(env) {
     return new Response(JSON.stringify(detailedList), { headers: {'Content-Type': 'application/json'} });
 }
 
-// ================= 🎨 前端 Vue UI (V17: 统一胶囊 + 字体微调) =================
+// ================= 🎨 前端 Vue UI (V21: 按钮逻辑修复 + 数据绑定) =================
 const htmlContent = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -352,8 +395,8 @@ const htmlContent = `
     --btn-text: #fff;
     --mask-gradient: linear-gradient(90deg, #EAECEF 28%, rgba(234,236,239,0.92) 55%, rgba(255,255,255,0.2) 100%);
     
-    /* 🔥 V17: 亮色模式详情文字 -> 纯黑 */
     --overview-text: #222; 
+    --action-sheet-bg: rgba(255, 255, 255, 0.85); 
   }
 
   @media (prefers-color-scheme: dark) {
@@ -377,11 +420,10 @@ const htmlContent = `
       --capsule-right-text: #ddd;
       --btn-bg: #fff;
       --btn-text: #000;
-      
       --mask-gradient: linear-gradient(90deg, #1e1e1e 28%, rgba(30,30,30,0.92) 55%, rgba(30,30,30,0.2) 100%);
       
-      /* 🔥 V17: 暗色模式详情文字 -> 纯白 */
-      --overview-text: #fff;
+      --overview-text: #fff; 
+      --action-sheet-bg: rgba(30, 30, 30, 0.85); 
     }
   }
 
@@ -403,7 +445,8 @@ const htmlContent = `
   .week-pill { padding: 7px 0; font-size: 12px; width: 100%; min-width: 0; text-align: center; background: var(--pill-bg); border-radius: 10px; font-weight: 700; color: var(--text-secondary); transition: all 0.2s; }
   .week-pill.active { background: var(--accent-purple); color: var(--pill-active-text); box-shadow: 0 3px 8px rgba(109, 40, 217, 0.3); }
   
-  .scroll-content { position: absolute; inset: 0; overflow-y: auto; padding: 0 16px; padding-top: calc(env(safe-area-inset-top) + 145px); padding-bottom: calc(env(safe-area-inset-bottom) + 80px); -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; z-index: 1; }
+  /* 列表容器下移，防止被头部遮挡 */
+  .scroll-content { position: absolute; inset: 0; overflow-y: auto; padding: 0 16px; padding-top: calc(env(safe-area-inset-top) + 165px); padding-bottom: calc(env(safe-area-inset-bottom) + 80px); -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; z-index: 1; }
   .scroll-content::-webkit-scrollbar { display: none; } 
   .list-container { display: flex; flex-direction: column; gap: 14px; }
   .rich-card { position: relative; width: 100%; height: 135px; border-radius: 22px; overflow: hidden; background: var(--card-bg); box-shadow: var(--card-shadow); display: flex; align-items: center; flex-shrink: 0; transition: transform 0.2s; cursor: pointer; }
@@ -421,10 +464,8 @@ const htmlContent = `
   .subtitle-txt { font-size: 12px; color: var(--text-secondary); font-weight: 600; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 4px; }
   .status-txt { font-size: 11px; color: var(--text-tertiary); font-weight: 600; margin-bottom: auto; display: flex; align-items: center; gap: 4px; }
   
-  /* 🔥 V17: 统一的胶囊样式 (删除了 trakt-pill 类) */
   .capsule-bar { margin-bottom: 5px; width: 88%; height: 24px; background: var(--capsule-bg); border-radius: 99px; display: flex; align-items: center; position: relative; backdrop-filter: blur(10px); padding: 2px; border: 1px solid var(--glass-border); }
   .capsule-left { background: var(--capsule-left-bg); color: var(--capsule-left-text); padding: 0 10px; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; border-radius: 99px; white-space: nowrap; z-index: 2; box-shadow: 2px 0 6px rgba(0,0,0,0.1); }
-  /* 🔥 V17: 进度条右侧文字，默认 10px */
   .capsule-right { flex: 1; text-align: right; padding-right: 10px; color: var(--capsule-right-text); font-size: 10px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.9; }
 
   .check-mark { position: absolute; bottom: 7px; right: 10px; color: var(--accent-purple); font-size: 15px; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1)); z-index: 5; }
@@ -464,8 +505,17 @@ const htmlContent = `
   .sheet-btn { width: 100%; padding: 16px; border-radius: 18px; background: var(--btn-bg); color: var(--btn-text); font-weight: 800; font-size: 17px; display: flex; justify-content: center; align-items: center; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.25); transition: transform 0.2s; } .sheet-btn:active { transform: scale(0.98); }
   .loading-box { display: flex; justify-content: center; padding-top: 200px; color: var(--text-tertiary); }
   
-  .action-menu-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; display: flex; flex-direction: column; justify-content: flex-end; animation: fadeIn 0.2s; }
-  .action-sheet { background: var(--action-sheet-bg); border-radius: 24px 24px 0 0; padding: 20px; padding-bottom: calc(20px + env(safe-area-inset-bottom)); animation: slideUp 0.3s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .action-menu-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.4); z-index: 200; display: flex; flex-direction: column; justify-content: flex-end; animation: fadeIn 0.2s; }
+  .action-sheet { 
+      background: var(--action-sheet-bg); 
+      border-radius: 24px 24px 0 0; 
+      padding: 20px; 
+      padding-bottom: calc(20px + env(safe-area-inset-bottom)); 
+      animation: slideUp 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+      backdrop-filter: blur(25px) saturate(180%);
+      -webkit-backdrop-filter: blur(25px) saturate(180%);
+      border-top: 1px solid var(--glass-border);
+  }
   .action-btn { display: flex; align-items: center; gap: 12px; padding: 16px; font-size: 16px; font-weight: 600; color: var(--text-primary); border-bottom: 1px solid var(--glass-border); }
   .action-btn:last-child { border-bottom: none; }
   .action-btn:active { background: var(--pill-bg); border-radius: 12px; }
@@ -517,10 +567,8 @@ const htmlContent = `
                         <div class="subtitle-txt">{{ formatSubtitle(item) }}</div>
                         <div class="status-txt"><i class="far fa-calendar-check"></i> {{ formatScheduleInfo(item) }}</div>
                         
-                        <!-- 🔥 V17: 统一使用 capsule-bar，内部根据内容判断 -->
                         <div class="capsule-bar">
                             <div class="capsule-left">{{ formatDuration(item) }}</div>
-                            <!-- 🔥 字体强制 9px，防止挤压 -->
                             <div class="capsule-right" style="font-size:9px">
                                 {{ currentSubTab === 'continue' ? formatTraktStats(item) : formatCapsuleRight(item) }}
                             </div>
@@ -572,6 +620,14 @@ const htmlContent = `
             <div class="action-btn" @click="performAction('remove_chase', menuItem)">
                 <i class="fas fa-ban text-gray-500"></i> 取消追番 (Untrack)
             </div>
+            
+            <div class="action-btn" @click="performAction('add_fav', menuItem)">
+                <i class="fas fa-star text-yellow-500"></i> 加入Trakt收藏 (Collection)
+            </div>
+             <div class="action-btn" @click="performAction('remove_fav', menuItem)">
+                <i class="fas fa-eraser text-purple-500"></i> 取消Trakt收藏
+            </div>
+            
             <div class="action-btn" @click="performAction('add_history', menuItem)">
                 <i class="fas fa-check-circle text-green-500"></i> 标记为已看 (Watched)
             </div>
@@ -601,7 +657,7 @@ createApp({
                 { key: 'continue', name: '继续观看' },
                 { key: 'chase',    name: '我的追番' },
                 { key: 'myschedule', name: '即将播出' },
-                { key: 'history',  name: '播放记录' } 
+                { key: 'trakt_fav',  name: 'Trakt收藏' }
             ]; 
             else if (currentMainTab.value === 'schedule') return []; 
             else return [ { key: 'trakt_hot', name: '热门趋势' }, { key: 'hot', name: '本周热榜' } ];
@@ -613,7 +669,7 @@ createApp({
                 'continue': '继续观看',
                 'chase': '我的追番', 
                 'myschedule': '即将播出',
-                'history': '播放记录', 
+                'trakt_fav': 'Trakt 收藏库',
                 'fav_all': 'TMDB收藏',
                 'trakt_hot': 'Trakt 热门', 
                 'hot': 'TMDB 热榜' 
@@ -641,7 +697,7 @@ createApp({
             if(currentSubTab.value === 'continue') url = '/api/user/continue';
             else if(currentSubTab.value === 'chase') url = '/api/user/watchlist';
             else if(currentSubTab.value === 'myschedule') url = '/api/user/myschedule';
-            else if(currentSubTab.value === 'history') url = '/api/user/history';
+            else if(currentSubTab.value === 'trakt_fav') url = '/api/user/trakt_fav';
             else if(currentSubTab.value === 'fav_all') url = '/api/user/favs';
             else url = \`/api/list?tab=\${currentSubTab.value}\`;
             
@@ -662,7 +718,13 @@ createApp({
                     body: JSON.stringify({ action, item })
                 });
                 if(!res.ok) throw new Error("失败");
-                const map = { 'add_chase': '❤️ 已加入追番', 'remove_chase': '💔 已取消追番', 'add_history': '🎉 标记为已看' };
+                const map = { 
+                    'add_chase': '❤️ 已加入追番', 
+                    'remove_chase': '💔 已取消追番', 
+                    'add_history': '🎉 标记为已看',
+                    'add_fav': '🌟 已加入收藏',   
+                    'remove_fav': '🌧️ 已取消收藏'
+                };
                 showToast(map[action] || '操作成功');
                 setTimeout(fetchData, 800);
             } catch(e) { showToast("❌ 操作失败"); }
@@ -717,7 +779,7 @@ createApp({
         };
 
         const formatScheduleInfo = (item) => { 
-            if (item.watch_progress) return \`已看 \${item.watch_progress}%\`;
+            if (item.watch_progress) return \`已看 \${parseFloat(item.watch_progress).toFixed(1)}%\`;
             if (item.status === 'Returning Series' && item.next_ep_date) { const day = new Date(item.next_ep_date).getDay(); const weekStr = ['日','一','二','三','四','五','六'][day]; return \`每周\${weekStr}更新\`; } 
             if (item.status === 'Ended' && item.first_air_date && item.last_ep_date) { const start = item.first_air_date.slice(0,4); const end = item.last_ep_date.slice(0,4); return \`\${start} - \${end}\`; } 
             if(item.release_date) return item.release_date; 
